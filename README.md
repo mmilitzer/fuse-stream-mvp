@@ -58,10 +58,12 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 ## Repo layout (target)
 
 ```
-/cmd/app/                  # entrypoint: starts mount + launches UI
+/main.go                   # entrypoint: starts mount + launches UI
+/frontend/                 # static HTML frontend (embedded at build time)
 /internal/api/             # MediaHub API client (OAuth, jobs, downloads)
 /internal/fetcher/         # HTTP Range fetcher with bounded readahead + LRU seek cache
 /internal/fs/              # FUSE RO FS (cgofuse) exposing /Staged
+/internal/daemon/          # daemon lifecycle management
 /ui/                       # Wails app (frontend + bindings)
 /pkg/config/               # config loader (toml + env overrides), no token persistence
 ```
@@ -112,7 +114,7 @@ wails build -skipbindings
 # - macOS: build/bin/fuse-stream-mvp.app
 
 # Headless build (for dev/testing, no GUI)
-go build -tags fuse -o fuse-stream-mvp-headless ./cmd/app
+go build -tags fuse -o fuse-stream-mvp-headless .
 ```
 
 ### Run (local)
@@ -142,7 +144,7 @@ open ./build/bin/fuse-stream-mvp.app     # macOS
 
 ```bash
 # Build with FUSE support
-go build -tags fuse -o fuse-stream-mvp-headless ./cmd/app
+go build -tags fuse -o fuse-stream-mvp-headless .
 
 # Run without GUI (daemon only)
 ./fuse-stream-mvp-headless --headless

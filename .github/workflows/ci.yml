@@ -34,7 +34,7 @@ jobs:
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin
-          go build -tags fuse -o build/bin/fuse-stream-mvp-headless ./cmd/app
+          go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -58,7 +58,7 @@ jobs:
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin
-          CGO_ENABLED=1 go build -tags fuse -o build/bin/fuse-stream-mvp-headless ./cmd/app
+          CGO_ENABLED=1 go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
