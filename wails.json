@@ -1,0 +1,23 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "fuse-stream-mvp",
+  "outputfilename": "fuse-stream-mvp",
+  "frontend:install": "echo 'Using embedded frontend from cmd/app/frontend'",
+  "frontend:build": "echo 'Frontend is pre-built and embedded'",
+  "frontend:dev:watcher": "echo 'No dev watcher for embedded frontend'",
+  "frontend:dev:serverUrl": "auto",
+  "wailsjsdir": "./ui/frontend",
+  "version": "2",
+  "author": {
+    "name": "mmilitzer",
+    "email": ""
+  },
+  "info": {
+    "companyName": "FuseStream",
+    "productName": "FuseStream MVP",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright.........",
+    "comments": "M1: Scaffold API + UI"
+  },
+  "nsisType": "multiple"
+}

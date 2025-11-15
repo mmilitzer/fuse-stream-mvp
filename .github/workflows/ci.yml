@@ -13,28 +13,29 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
-      - name: Build (no FUSE tag)
-        run: go build ./...
-      - name: Build CLI binary
-        run: |
-          mkdir -p dist
-          go build -o dist/fuse-stream-mvp ./cmd/app
-      - name: Build Wails (headless)
-        run: |
-          wails build -skipbindings || true
-          if [ -d build/bin ]; then cp -R build/bin/* dist/; fi
       - name: Unit tests
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
-        run: go test ./... -run Test -v || true
+        run: go test ./... -run Test -v
+      - name: Build Wails GUI app
+        run: |
+          wails build -skipbindings -platform linux/amd64
+      - name: Build headless binary (for dev/testing)
+        run: |
+          mkdir -p build/bin
+          go build -tags fuse -o build/bin/fuse-stream-mvp-headless ./cmd/app
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-build
-          path: dist/**
+          path: build/bin/**
 
   build-macos:
     runs-on: macos-latest
@@ -47,21 +48,18 @@ jobs:
           go-version: '1.22'
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
-      - name: Build (no FUSE tag)
-        run: go build ./...
-      - name: Build CLI binary
+      - name: Build Wails GUI app
         run: |
-          mkdir -p dist
-          go build -o dist/fuse-stream-mvp ./cmd/app
-      - name: Build Wails (headless)
+          wails build -skipbindings -platform darwin/universal
+      - name: Build headless binary (for dev/testing)
         run: |
-          wails build -skipbindings || true
-          if [ -d build/bin ]; then cp -R build/bin/* dist/; fi
+          mkdir -p build/bin
+          CGO_ENABLED=1 go build -tags fuse -o build/bin/fuse-stream-mvp-headless ./cmd/app
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-build
-          path: dist/**
+          path: build/bin/**
 
   live-contract-tests:
     if: >
