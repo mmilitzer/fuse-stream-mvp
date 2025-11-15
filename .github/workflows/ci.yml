@@ -13,8 +13,18 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build (no FUSE tag)
         run: go build ./...
+      - name: Build CLI binary
+        run: |
+          mkdir -p dist
+          go build -o dist/fuse-stream-mvp ./cmd/app
+      - name: Build Wails (headless)
+        run: |
+          wails build -skipbindings || true
+          if [ -d build/bin ]; then cp -R build/bin/* dist/; fi
       - name: Unit tests
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
@@ -23,11 +33,8 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-artifacts
-          path: |
-            **/*.go
-            go.mod
-            go.sum
+          name: linux-build
+          path: dist/**
 
   build-macos:
     runs-on: macos-latest
@@ -38,13 +45,35 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build (no FUSE tag)
         run: go build ./...
+      - name: Build CLI binary
+        run: |
+          mkdir -p dist
+          go build -o dist/fuse-stream-mvp ./cmd/app
+      - name: Build Wails (headless)
+        run: |
+          wails build -skipbindings || true
+          if [ -d build/bin ]; then cp -R build/bin/* dist/; fi
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-artifacts
-          path: |
-            **/*.go
-            go.mod
-            go.sum
+          name: macos-build
+          path: dist/**
+
+  live-contract-tests:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run live tests
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
+        run: go test ./internal/api -run Live -v

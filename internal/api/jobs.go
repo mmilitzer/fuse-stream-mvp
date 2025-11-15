@@ -32,34 +32,13 @@ func NewClient(apiBase, clientID, clientSecret string) *Client {
 	}
 }
 
-type jobsResponse struct {
-	Items []jobItem `json:"items"`
-}
-
-type jobItem struct {
-	ID    string         `json:"id"`
-	Input jobInputDetail `json:"input"`
-	Files []fileDetail   `json:"files"`
-}
-
-type jobInputDetail struct {
-	Name string `json:"name"`
-}
-
-type fileDetail struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Size        int64  `json:"size"`
-	ContentType string `json:"content_type"`
-}
-
 func (c *Client) ListJobs() ([]Job, error) {
 	token, err := c.tokenCache.GetToken()
 	if err != nil {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/jobs?expand=file", c.apiBase)
+	url := fmt.Sprintf("%s/jobs?status=SUCCESS&expand=file", c.apiBase)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create jobs request: %w", err)
@@ -77,28 +56,76 @@ func (c *Client) ListJobs() ([]Job, error) {
 		return nil, fmt.Errorf("jobs request failed: %d %s", resp.StatusCode, string(body))
 	}
 
-	var jr jobsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, fmt.Errorf("decode jobs response: %w", err)
 	}
 
-	jobs := make([]Job, 0, len(jr.Items))
-	for _, item := range jr.Items {
+	jobsArray, ok := data["jobs"].([]any)
+	if !ok {
+		return []Job{}, nil
+	}
+
+	jobs := make([]Job, 0, len(jobsArray))
+	for _, jobData := range jobsArray {
+		jobMap, ok := jobData.(map[string]any)
+		if !ok {
+			continue
+		}
+
 		job := Job{
-			ID:        item.ID,
-			InputName: item.Input.Name,
-			Outputs:   make([]Output, 0, len(item.Files)),
+			ID: getString(jobMap, "id"),
 		}
-		for _, f := range item.Files {
-			job.Outputs = append(job.Outputs, Output{
-				FileID:      f.ID,
-				FileName:    f.Name,
-				Size:        f.Size,
-				ContentType: f.ContentType,
-			})
+
+		if input, ok := jobMap["input"].(map[string]any); ok {
+			job.InputName = getString(input, "input_name")
 		}
+
+		if outputs, ok := jobMap["outputs"].([]any); ok {
+			job.Outputs = make([]Output, 0, len(outputs))
+			for _, outData := range outputs {
+				outMap, ok := outData.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if fileMap, ok := outMap["file"].(map[string]any); ok {
+					output := Output{
+						FileID:      getString(fileMap, "id"),
+						FileName:    getString(fileMap, "name"),
+						Size:        getInt64(fileMap, "size"),
+						ContentType: getString(fileMap, "mime_type"),
+					}
+					job.Outputs = append(job.Outputs, output)
+				}
+			}
+		}
+
 		jobs = append(jobs, job)
 	}
 
 	return jobs, nil
+}
+
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func getInt64(m map[string]any, key string) int64 {
+	if v, ok := m[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return int64(n)
+		case int64:
+			return n
+		case int:
+			return int64(n)
+		}
+	}
+	return 0
 }
