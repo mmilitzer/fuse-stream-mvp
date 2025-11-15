@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"embed"
 	"flag"
 	"log"
 	"os"
@@ -13,14 +12,12 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 
+	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/mmilitzer/fuse-stream-mvp/ui"
 )
-
-//go:embed all:frontend
-var assets embed.FS
 
 var headless = flag.Bool("headless", false, "Run in headless mode (no GUI, daemon only)")
 
@@ -69,7 +66,7 @@ func main() {
 		Width:  900,
 		Height: 700,
 		AssetServer: &assetserver.Options{
-			Assets: assets,
+			Assets: frontend.Assets,
 		},
 		OnStartup: app.Startup,
 		OnShutdown: func(ctx context.Context) {

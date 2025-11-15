@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FuseStream MVP</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-top: 0;
+        }
+        .screen {
+            display: none;
+        }
+        .screen.active {
+            display: block;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .job-list, .output-list {
+            list-style: none;
+            padding: 0;
+        }
+        .job-item, .output-item {
+            padding: 15px;
+            margin: 10px 0;
+            background: #f8f9fa;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .job-item:hover, .output-item:hover {
+            background: #e9ecef;
+        }
+        .job-item.selected, .output-item.selected {
+            background: #d3e8ff;
+            border: 2px solid #007bff;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-size: 14px;
+        }
+        .drag-tile {
+            width: 200px;
+            height: 200px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            margin: 20px auto;
+            cursor: move;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        .info {
+            color: #666;
+            font-size: 14px;
+            margin: 10px 0;
+        }
+        .error {
+            color: #dc3545;
+            padding: 10px;
+            background: #f8d7da;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Screen A: List Jobs -->
+        <div id="screen-jobs" class="screen active">
+            <h1>Select a Job</h1>
+            <div class="info">Loading jobs from MediaHub...</div>
+            <ul id="job-list" class="job-list"></ul>
+            <button id="btn-refresh-jobs">Refresh Jobs</button>
+        </div>
+
+        <!-- Screen B: Select Output -->
+        <div id="screen-outputs" class="screen">
+            <h1>Select Output File</h1>
+            <div class="info" id="selected-job-name"></div>
+            <ul id="output-list" class="output-list"></ul>
+            <button id="btn-back-to-jobs">← Back to Jobs</button>
+        </div>
+
+        <!-- Screen C: Enter Recipient & Stage -->
+        <div id="screen-recipient" class="screen">
+            <h1>Stage for Upload</h1>
+            <div class="info" id="selected-file-info"></div>
+            <label for="recipient-input">Recipient Identifier (autograph_tag):</label>
+            <input type="text" id="recipient-input" placeholder="e.g., user@example.com or identifier" />
+            <button id="btn-stage">Stage for Upload</button>
+            <button id="btn-back-to-outputs">← Back to Outputs</button>
+            
+            <!-- Drag tile (shown after staging) -->
+            <div id="drag-tile" class="drag-tile" style="display:none;" draggable="true">
+                Drag to Upload
+            </div>
+            <div id="staged-path" class="info" style="display:none;"></div>
+        </div>
+
+        <div id="error-message" class="error" style="display:none;"></div>
+    </div>
+
+    <script src="wailsjs/runtime/runtime.js"></script>
+    <script src="wailsjs/go/ui/App.js"></script>
+    <script>
+        let selectedJob = null;
+        let selectedOutput = null;
+
+        function showScreen(screenId) {
+            document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+            document.getElementById(screenId).classList.add('active');
+            hideError();
+        }
+
+        function showError(msg) {
+            const el = document.getElementById('error-message');
+            el.textContent = msg;
+            el.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('error-message').style.display = 'none';
+        }
+
+        function loadJobs() {
+            const list = document.getElementById('job-list');
+            const info = document.querySelector('#screen-jobs .info');
+            info.textContent = 'Loading jobs...';
+            list.innerHTML = '';
+
+            // M1 stub: show mock data if API fails
+            window.go.ui.App.GetJobs()
+                .then(jobs => {
+                    info.textContent = jobs.length > 0 ? 'Select a job to continue:' : 'No jobs found.';
+                    jobs.forEach(job => {
+                        const li = document.createElement('li');
+                        li.className = 'job-item';
+                        li.textContent = job.inputName || job.id;
+                        li.onclick = () => selectJob(job);
+                        list.appendChild(li);
+                    });
+                })
+                .catch(err => {
+                    showError('Failed to load jobs: ' + err);
+                    info.textContent = 'Error loading jobs.';
+                });
+        }
+
+        function selectJob(job) {
+            selectedJob = job;
+            if (job.outputs && job.outputs.length > 1) {
+                showOutputs(job);
+            } else if (job.outputs && job.outputs.length === 1) {
+                selectedOutput = job.outputs[0];
+                showRecipientScreen();
+            } else {
+                showError('No outputs available for this job.');
+            }
+        }
+
+        function showOutputs(job) {
+            document.getElementById('selected-job-name').textContent = `Job: ${job.inputName || job.id}`;
+            const list = document.getElementById('output-list');
+            list.innerHTML = '';
+            job.outputs.forEach(out => {
+                const li = document.createElement('li');
+                li.className = 'output-item';
+                const sizeKB = (out.size / 1024).toFixed(2);
+                li.innerHTML = `<strong>${out.fileName}</strong><br>` +
+                               `<small>${out.contentType} • ${sizeKB} KB</small>`;
+                li.onclick = () => {
+                    selectedOutput = out;
+                    showRecipientScreen();
+                };
+                list.appendChild(li);
+            });
+            showScreen('screen-outputs');
+        }
+
+        function showRecipientScreen() {
+            document.getElementById('selected-file-info').textContent = 
+                `File: ${selectedOutput.fileName} (${(selectedOutput.size / 1024 / 1024).toFixed(2)} MB)`;
+            document.getElementById('drag-tile').style.display = 'none';
+            document.getElementById('staged-path').style.display = 'none';
+            document.getElementById('recipient-input').value = '';
+            showScreen('screen-recipient');
+        }
+
+        function stageForUpload() {
+            const recipientTag = document.getElementById('recipient-input').value.trim();
+            if (!recipientTag) {
+                showError('Please enter a recipient identifier.');
+                return;
+            }
+
+            window.go.ui.App.StageForUpload({
+                fileId: selectedOutput.fileId,
+                fileName: selectedOutput.fileName,
+                recipientTag: recipientTag
+            })
+            .then(resp => {
+                if (resp.success) {
+                    document.getElementById('drag-tile').style.display = 'flex';
+                    document.getElementById('staged-path').textContent = 
+                        `File path: ${resp.filePath}\n${resp.message}`;
+                    document.getElementById('staged-path').style.display = 'block';
+                } else {
+                    showError(resp.message || 'Failed to stage file.');
+                }
+            })
+            .catch(err => {
+                showError('Error staging file: ' + err);
+            });
+        }
+
+        // Event listeners
+        document.getElementById('btn-refresh-jobs').onclick = loadJobs;
+        document.getElementById('btn-back-to-jobs').onclick = () => showScreen('screen-jobs');
+        document.getElementById('btn-back-to-outputs').onclick = () => showOutputs(selectedJob);
+        document.getElementById('btn-stage').onclick = stageForUpload;
+
+        // Initialize
+        loadJobs();
+    </script>
+</body>
+</html>
