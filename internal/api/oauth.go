@@ -51,11 +51,11 @@ func (tc *TokenCache) GetToken() (string, error) {
 	}
 
 	data := url.Values{}
-	data.Set("grant_type", "client_credentials")
+	data.Set("grant_type", "client_credential")
 	data.Set("client_id", tc.clientID)
 	data.Set("client_secret", tc.clientSecret)
 
-	tokenURL := fmt.Sprintf("%s/oauth2/token", tc.apiBase)
+	tokenURL := fmt.Sprintf("%s/oauth2/token/", tc.apiBase)
 	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("create token request: %w", err)

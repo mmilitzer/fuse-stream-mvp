@@ -85,12 +85,12 @@ func TestListJobsWithMockServer(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/oauth2/token" {
+		if r.URL.Path == "/oauth2/token/" {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"access_token":"test_token","expires_in":3600,"token_type":"Bearer"}`))
 			return
 		}
-		if r.URL.Path == "/jobs" {
+		if r.URL.Path == "/jobs/" {
 			auth := r.Header.Get("Authorization")
 			if auth != "Bearer test_token" {
 				t.Errorf("Expected Bearer test_token, got %s", auth)

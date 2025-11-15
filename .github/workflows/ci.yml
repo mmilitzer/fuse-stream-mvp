@@ -64,7 +64,10 @@ jobs:
           path: dist/**
 
   live-contract-tests:
-    if: github.event_name == 'workflow_dispatch'
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+      || github.event_name == 'push'
     runs-on: macos-latest
     timeout-minutes: 8
     steps:

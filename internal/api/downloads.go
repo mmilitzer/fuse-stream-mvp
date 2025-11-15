@@ -11,7 +11,7 @@ func (c *Client) BuildTempURL(fileID, autographTag string) (string, error) {
 		return "", err
 	}
 
-	url := fmt.Sprintf("%s/files/downloads?file_id=%s&autograph_tag=%s&redirect=true",
+	url := fmt.Sprintf("%s/files/downloads/?file_id=%s&autograph_tag=%s&redirect=true",
 		c.apiBase, fileID, autographTag)
 
 	client := &http.Client{

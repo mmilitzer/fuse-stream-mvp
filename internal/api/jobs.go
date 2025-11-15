@@ -38,7 +38,7 @@ func (c *Client) ListJobs() ([]Job, error) {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/jobs?status=SUCCESS&expand=file", c.apiBase)
+	url := fmt.Sprintf("%s/jobs/?status=SUCCESS&expand=file", c.apiBase)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create jobs request: %w", err)
