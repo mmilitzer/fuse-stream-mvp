@@ -121,6 +121,28 @@ The app mounts (e.g., `/Volumes/FuseStream`) and opens a window:
 - A file appears in `Staged/` and a big draggable tile is shown.
 - Drag the tile into the target site’s upload zone; upload continues in background.
 
+### Testing
+
+**Unit tests** (with mock server, no credentials required):
+```bash
+go test ./...
+```
+
+**Live contract tests** (requires real MediaHub credentials):
+```bash
+export MEDIAHUB_CLIENT_ID="your_client_id"
+export MEDIAHUB_CLIENT_SECRET="your_client_secret"
+go test -v ./internal/api -run TestLive
+```
+
+The live tests validate:
+- OAuth token acquisition
+- Jobs list with `status=SUCCESS` filter
+- Download URL generation with `autograph_tag`
+
+In CI, live tests can be triggered manually via **workflow_dispatch** on the `live-contract-tests` job, which uses repository secrets.
+
+
 ---
 
 ## Milestones & acceptance
