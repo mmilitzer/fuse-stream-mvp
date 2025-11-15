@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/build/
+/vendor/
+*.log
+.DS_Store
+*.tmp
+*.swp
+node_modules/
+/ui/build/
+/ui/node_modules/
+/ui/dist/
