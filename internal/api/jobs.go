@@ -78,7 +78,9 @@ func (c *Client) ListJobs() ([]Job, error) {
 		}
 
 		if input, ok := jobMap["input"].(map[string]any); ok {
-			job.InputName = getString(input, "input_name")
+			if fileMap, ok := input["file"].(map[string]any); ok {
+				job.InputName = getString(fileMap, "name")
+			}
 		}
 
 		if outputs, ok := jobMap["outputs"].([]any); ok {

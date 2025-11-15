@@ -123,8 +123,8 @@ func TestListJobsWithMockServer(t *testing.T) {
 	if job1.ID != "58124aafe4b097397e2370e7" {
 		t.Errorf("Expected job ID 58124aafe4b097397e2370e7, got %s", job1.ID)
 	}
-	if job1.InputName != "http://s3-eu-west-1.amazonaws.com/test-videos/ED_HD.avi" {
-		t.Errorf("Unexpected input name: %s", job1.InputName)
+	if job1.InputName != "ED_HD.avi" {
+		t.Errorf("Expected input name ED_HD.avi, got %s", job1.InputName)
 	}
 	if len(job1.Outputs) != 1 {
 		t.Errorf("Expected 1 output, got %d", len(job1.Outputs))
@@ -145,6 +145,9 @@ func TestListJobsWithMockServer(t *testing.T) {
 	}
 
 	job2 := jobs[1]
+	if job2.InputName != "test-video.mov" {
+		t.Errorf("Expected input name test-video.mov, got %s", job2.InputName)
+	}
 	if len(job2.Outputs) != 2 {
 		t.Errorf("Expected 2 outputs in second job, got %d", len(job2.Outputs))
 	}
