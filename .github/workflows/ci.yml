@@ -16,6 +16,9 @@ jobs:
       - name: Build (no FUSE tag)
         run: go build ./...
       - name: Unit tests
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
         run: go test ./... -run Test -v || true
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
