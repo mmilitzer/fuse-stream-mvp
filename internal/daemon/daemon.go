@@ -1,3 +1,5 @@
+//go:build fuse
+
 package daemon
 
 import (
