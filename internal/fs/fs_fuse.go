@@ -18,47 +18,40 @@ import (
 
 const stagedDirName = "Staged"
 
-type StagedFile struct {
-	ID           string
-	FileID       string
-	FileName     string
-	RecipientTag string
-	Size         int64
-	ContentType  string
-	ModTime      time.Time
-	Status       string // "idle", "open", "reading", "done", "error"
-	
-	fetcher      *fetcher.Fetcher
-	fetcherMu    sync.Mutex
-	openCount    int
+type stagedFileFuse struct {
+	*StagedFile
+	fetcher   *fetcher.Fetcher
+	fetcherMu sync.Mutex
+	openCount int
 }
 
-type FS struct {
+type fuseFS struct {
 	mountpoint  string
+	mounted     bool
 	client      *api.Client
-	stagedFiles map[string]*StagedFile
+	stagedFiles map[string]*stagedFileFuse
 	mu          sync.RWMutex
 	host        *fuse.FileSystemHost
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
 
-func New(mountpoint string, client *api.Client) *FS {
+func newFS(client *api.Client) FS {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FS{
-		mountpoint:  mountpoint,
+	return &fuseFS{
 		client:      client,
-		stagedFiles: make(map[string]*StagedFile),
+		stagedFiles: make(map[string]*stagedFileFuse),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 }
 
-func (fs *FS) Mount() error {
+func (fs *fuseFS) Start(opts MountOptions) error {
+	fs.mountpoint = opts.Mountpoint
 	fs.host = fuse.NewFileSystemHost(fs)
 	
 	// Mount options
-	opts := []string{
+	mountOpts := []string{
 		"-o", "ro",                    // Read-only
 		"-o", "fsname=fusestream",     // Filesystem name
 		"-o", "volname=FuseStream",    // Volume name
@@ -67,28 +60,38 @@ func (fs *FS) Mount() error {
 
 	// Mount the filesystem
 	go func() {
-		if !fs.host.Mount(fs.mountpoint, opts) {
+		if !fs.host.Mount(fs.mountpoint, mountOpts) {
 			log.Printf("Failed to mount filesystem at %s", fs.mountpoint)
 		}
 	}()
 
 	// Wait a bit for mount to complete
 	time.Sleep(100 * time.Millisecond)
+	fs.mounted = true
 	
 	return nil
 }
 
-func (fs *FS) Unmount() error {
+func (fs *fuseFS) Stop() error {
 	fs.cancel()
 	if fs.host != nil {
 		if !fs.host.Unmount() {
 			return fmt.Errorf("failed to unmount filesystem")
 		}
 	}
+	fs.mounted = false
 	return nil
 }
 
-func (fs *FS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
+func (fs *fuseFS) Mountpoint() string {
+	return fs.mountpoint
+}
+
+func (fs *fuseFS) Mounted() bool {
+	return fs.mounted
+}
+
+func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -105,36 +108,38 @@ func (fs *FS) StageFile(fileID, fileName, recipientTag string, size int64, conte
 		Status:       "idle",
 	}
 
-	fs.stagedFiles[id] = sf
+	fs.stagedFiles[id] = &stagedFileFuse{
+		StagedFile: sf,
+	}
 	return sf, nil
 }
 
-func (fs *FS) GetStagedFiles() []*StagedFile {
+func (fs *fuseFS) GetStagedFiles() []*StagedFile {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
 	files := make([]*StagedFile, 0, len(fs.stagedFiles))
-	for _, sf := range fs.stagedFiles {
-		files = append(files, sf)
+	for _, sff := range fs.stagedFiles {
+		files = append(files, sff.StagedFile)
 	}
 	return files
 }
 
-func (fs *FS) GetFilePath(stagedFile *StagedFile) string {
+func (fs *fuseFS) GetFilePath(stagedFile *StagedFile) string {
 	return filepath.Join(fs.mountpoint, stagedDirName, stagedFile.ID, stagedFile.FileName)
 }
 
 // FUSE operations
 
-func (fs *FS) Init() {
+func (fs *fuseFS) Init() {
 	log.Println("[FUSE] Filesystem initialized")
 }
 
-func (fs *FS) Destroy() {
+func (fs *fuseFS) Destroy() {
 	log.Println("[FUSE] Filesystem destroyed")
 }
 
-func (fs *FS) Statfs(path string, stat *fuse.Statfs_t) int {
+func (fs *fuseFS) Statfs(path string, stat *fuse.Statfs_t) int {
 	stat.Bsize = 4096
 	stat.Frsize = 4096
 	stat.Blocks = 1000000
@@ -147,7 +152,7 @@ func (fs *FS) Statfs(path string, stat *fuse.Statfs_t) int {
 	return 0
 }
 
-func (fs *FS) Access(path string, mask uint32) int {
+func (fs *fuseFS) Access(path string, mask uint32) int {
 	stat := &fuse.Stat_t{}
 	result := fs.Getattr(path, stat, 0)
 	if result != 0 {
@@ -159,7 +164,7 @@ func (fs *FS) Access(path string, mask uint32) int {
 	return 0
 }
 
-func (fs *FS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	path = strings.TrimPrefix(path, "/")
 	
 	// Root directory
@@ -212,7 +217,7 @@ func (fs *FS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	return -fuse.ENOENT
 }
 
-func (fs *FS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
 	path = strings.TrimPrefix(path, "/")
 
 	// Root directory - show Staged/
@@ -258,7 +263,7 @@ func (fs *FS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofs
 	return -fuse.ENOENT
 }
 
-func (fs *FS) Open(path string, flags int) (int, uint64) {
+func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 	path = strings.TrimPrefix(path, "/")
 	
 	// Check if it's a staged file
@@ -304,7 +309,7 @@ func (fs *FS) Open(path string, flags int) (int, uint64) {
 	return -fuse.ENOENT, ^uint64(0)
 }
 
-func (fs *FS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	path = strings.TrimPrefix(path, "/")
 	
 	if strings.HasPrefix(path, stagedDirName+"/") {
@@ -348,7 +353,7 @@ func (fs *FS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	return -fuse.ENOENT
 }
 
-func (fs *FS) Release(path string, fh uint64) int {
+func (fs *fuseFS) Release(path string, fh uint64) int {
 	path = strings.TrimPrefix(path, "/")
 	
 	if strings.HasPrefix(path, stagedDirName+"/") {
@@ -381,55 +386,55 @@ func (fs *FS) Release(path string, fh uint64) int {
 
 // Read-only filesystem stubs - return appropriate errors
 
-func (fs *FS) Chmod(path string, mode uint32) int {
+func (fs *fuseFS) Chmod(path string, mode uint32) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Chown(path string, uid uint32, gid uint32) int {
+func (fs *fuseFS) Chown(path string, uid uint32, gid uint32) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Utimens(path string, tmsp []fuse.Timespec) int {
+func (fs *fuseFS) Utimens(path string, tmsp []fuse.Timespec) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Create(path string, flags int, mode uint32) (int, uint64) {
+func (fs *fuseFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	return -fuse.EROFS, ^uint64(0)
 }
 
-func (fs *FS) Mkdir(path string, mode uint32) int {
+func (fs *fuseFS) Mkdir(path string, mode uint32) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Unlink(path string) int {
+func (fs *fuseFS) Unlink(path string) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Rmdir(path string) int {
+func (fs *fuseFS) Rmdir(path string) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Rename(oldpath string, newpath string) int {
+func (fs *fuseFS) Rename(oldpath string, newpath string) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Truncate(path string, size int64, fh uint64) int {
+func (fs *fuseFS) Truncate(path string, size int64, fh uint64) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+func (fs *fuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Flush(path string, fh uint64) int {
+func (fs *fuseFS) Flush(path string, fh uint64) int {
 	return 0
 }
 
-func (fs *FS) Fsync(path string, datasync bool, fh uint64) int {
+func (fs *fuseFS) Fsync(path string, datasync bool, fh uint64) int {
 	return 0
 }
 
-func (fs *FS) Opendir(path string) (int, uint64) {
+func (fs *fuseFS) Opendir(path string) (int, uint64) {
 	stat := &fuse.Stat_t{}
 	result := fs.Getattr(path, stat, 0)
 	if result != 0 {
@@ -441,42 +446,42 @@ func (fs *FS) Opendir(path string) (int, uint64) {
 	return 0, 0
 }
 
-func (fs *FS) Releasedir(path string, fh uint64) int {
+func (fs *fuseFS) Releasedir(path string, fh uint64) int {
 	return 0
 }
 
-func (fs *FS) Fsyncdir(path string, datasync bool, fh uint64) int {
+func (fs *fuseFS) Fsyncdir(path string, datasync bool, fh uint64) int {
 	return 0
 }
 
-func (fs *FS) Readlink(path string) (int, string) {
+func (fs *fuseFS) Readlink(path string) (int, string) {
 	return -fuse.ENOSYS, ""
 }
 
-func (fs *FS) Symlink(target string, newpath string) int {
+func (fs *fuseFS) Symlink(target string, newpath string) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Link(oldpath string, newpath string) int {
+func (fs *fuseFS) Link(oldpath string, newpath string) int {
 	return -fuse.EROFS
 }
 
-func (fs *FS) Setxattr(path string, name string, value []byte, flags int) int {
+func (fs *fuseFS) Setxattr(path string, name string, value []byte, flags int) int {
 	return -fuse.ENOSYS
 }
 
-func (fs *FS) Getxattr(path string, name string) (int, []byte) {
+func (fs *fuseFS) Getxattr(path string, name string) (int, []byte) {
 	return -fuse.ENOSYS, nil
 }
 
-func (fs *FS) Removexattr(path string, name string) int {
+func (fs *fuseFS) Removexattr(path string, name string) int {
 	return -fuse.ENOSYS
 }
 
-func (fs *FS) Listxattr(path string, fill func(name string) bool) int {
+func (fs *fuseFS) Listxattr(path string, fill func(name string) bool) int {
 	return -fuse.ENOSYS
 }
 
-func (fs *FS) Mknod(path string, mode uint32, dev uint64) int {
+func (fs *fuseFS) Mknod(path string, mode uint32, dev uint64) int {
 	return -fuse.EROFS
 }

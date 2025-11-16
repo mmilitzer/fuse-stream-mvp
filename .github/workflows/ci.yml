@@ -13,6 +13,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse-dev
       - name: Build frontend
         run: |
           cd frontend
@@ -21,7 +25,7 @@ jobs:
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
-        run: go test ./... -run Test -v
+        run: go test ./... -run Test -v -tags fuse
 
   build-linux:
     runs-on: ubuntu-22.04
@@ -45,7 +49,7 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build Wails GUI app
         run: |
-          wails build -skipbindings -platform linux/amd64
+          wails build -skipbindings -platform linux/amd64 -tags fuse
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin

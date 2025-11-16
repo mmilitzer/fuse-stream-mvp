@@ -4,50 +4,77 @@ package fs
 
 import (
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 )
 
-type StagedFile struct {
-	ID           string
-	FileID       string
-	FileName     string
-	RecipientTag string
-	Size         int64
-	ContentType  string
-	ModTime      time.Time
-	Status       string
+type stubFS struct {
+	mountpoint  string
+	client      *api.Client
+	stagedFiles map[string]*StagedFile
+	mu          sync.RWMutex
 }
 
-type FS struct {
-	mountpoint string
-	client     *api.Client
-}
-
-func New(mountpoint string, client *api.Client) *FS {
-	return &FS{
-		mountpoint: mountpoint,
-		client:     client,
+func newFS(client *api.Client) FS {
+	return &stubFS{
+		client:      client,
+		stagedFiles: make(map[string]*StagedFile),
 	}
 }
 
-func (fs *FS) Mount() error {
-	return fmt.Errorf("FUSE support not compiled in (build with -tags fuse)")
-}
-
-func (fs *FS) Unmount() error {
-	return fmt.Errorf("FUSE support not compiled in (build with -tags fuse)")
-}
-
-func (fs *FS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
-	return nil, fmt.Errorf("FUSE support not compiled in (build with -tags fuse)")
-}
-
-func (fs *FS) GetStagedFiles() []*StagedFile {
+func (fs *stubFS) Start(opts MountOptions) error {
+	fs.mountpoint = opts.Mountpoint
+	log.Printf("[STUB] FUSE support not available (build with -tags fuse). API and UI will work but filesystem features are disabled.")
 	return nil
 }
 
-func (fs *FS) GetFilePath(sf *StagedFile) string {
-	return ""
+func (fs *stubFS) Stop() error {
+	return nil
+}
+
+func (fs *stubFS) Mountpoint() string {
+	return fs.mountpoint
+}
+
+func (fs *stubFS) Mounted() bool {
+	return false
+}
+
+func (fs *stubFS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
+	
+	sf := &StagedFile{
+		ID:           id,
+		FileID:       fileID,
+		FileName:     fileName,
+		RecipientTag: recipientTag,
+		Size:         size,
+		ContentType:  contentType,
+		ModTime:      time.Now(),
+		Status:       "unavailable",
+	}
+
+	fs.stagedFiles[id] = sf
+	return sf, nil
+}
+
+func (fs *stubFS) GetStagedFiles() []*StagedFile {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	files := make([]*StagedFile, 0, len(fs.stagedFiles))
+	for _, sf := range fs.stagedFiles {
+		files = append(files, sf)
+	}
+	return files
+}
+
+func (fs *stubFS) GetFilePath(sf *StagedFile) string {
+	return fmt.Sprintf("(FUSE unavailable - build with -tags fuse)")
 }

@@ -1,5 +1,3 @@
-//go:build fuse
-
 package daemon
 
 import (
@@ -20,7 +18,7 @@ var (
 )
 
 type Daemon struct {
-	fs     *fs.FS
+	fs     fs.FS
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -40,13 +38,13 @@ func Start(ctx context.Context, mountpoint string, client *api.Client) error {
 		return fmt.Errorf("create mountpoint: %w", err)
 	}
 
-	// Create and mount filesystem
+	// Create and start filesystem (FUSE or stub based on build tags)
 	daemonCtx, cancel := context.WithCancel(ctx)
-	filesystem := fs.New(mountpoint, client)
+	filesystem := fs.New(client)
 	
-	if err := filesystem.Mount(); err != nil {
+	if err := filesystem.Start(fs.MountOptions{Mountpoint: mountpoint}); err != nil {
 		cancel()
-		return fmt.Errorf("mount filesystem: %w", err)
+		return fmt.Errorf("start filesystem: %w", err)
 	}
 
 	instance = &Daemon{
@@ -63,18 +61,22 @@ func Start(ctx context.Context, mountpoint string, client *api.Client) error {
 		// Give time for active operations to complete
 		time.Sleep(100 * time.Millisecond)
 		
-		if err := filesystem.Unmount(); err != nil {
-			log.Printf("[daemon] Error unmounting: %v", err)
+		if err := filesystem.Stop(); err != nil {
+			log.Printf("[daemon] Error stopping filesystem: %v", err)
 		}
 		
 		log.Println("[daemon] Shutdown complete")
 	}()
 
-	log.Printf("[daemon] FUSE filesystem mounted at %s", mountpoint)
+	if filesystem.Mounted() {
+		log.Printf("[daemon] FUSE filesystem mounted at %s", mountpoint)
+	} else {
+		log.Printf("[daemon] Running in stub mode (FUSE unavailable)")
+	}
 	return nil
 }
 
-func GetFS() *fs.FS {
+func GetFS() fs.FS {
 	mu.Lock()
 	defer mu.Unlock()
 	
