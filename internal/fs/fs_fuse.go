@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -50,11 +51,23 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
 	fs.host = fuse.NewFileSystemHost(fs)
 	
-	// Mount options
+	// Mount options (OS-specific)
 	mountOpts := []string{
-		"-o", "ro",                    // Read-only
-		"-o", "fsname=fusestream",     // Filesystem name
-		"-o", "volname=FuseStream",    // Volume name
+		"-o", "ro",
+		"-o", "fsname=fusestream",
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		// macFUSE/macOS-specific options
+		mountOpts = append(mountOpts,
+			"-o", "local",
+			"-o", "volname=FuseStream",
+		)
+	case "linux":
+		// Linux: NO volname (not supported), and NO allow_other by default
+		// If you need allow_other, it requires user_allow_other in /etc/fuse.conf
+		// and can be gated by a config option in the future
 	}
 
 	// Mount the filesystem
