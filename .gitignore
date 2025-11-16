@@ -13,3 +13,5 @@ node_modules/
 /cmd/app/app
 /cmd/app/app.exe
 config.toml
+/frontend/dist/
+/frontend/node_modules/
