@@ -3,7 +3,7 @@
 package drag
 
 /*
-#cgo pkg-config: gtk4
+#cgo pkg-config: gtk+-3.0
 #include "drag_linux.h"
 #include <stdlib.h>
 */
@@ -14,7 +14,7 @@ import (
 	"unsafe"
 )
 
-// StartFileDrag begins a native Linux GTK4 drag of a real filesystem path.
+// StartFileDrag begins a native Linux GTK3 drag of a real filesystem path.
 func StartFileDrag(path string) error {
 	// Verify the file exists before attempting to drag
 	if _, err := os.Stat(path); err != nil {
