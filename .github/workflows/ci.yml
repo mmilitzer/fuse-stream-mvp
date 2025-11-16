@@ -23,6 +23,10 @@ jobs:
             libayatana-appindicator3-dev
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
       - name: Unit tests
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
