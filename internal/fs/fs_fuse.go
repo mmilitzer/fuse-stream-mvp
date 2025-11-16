@@ -17,6 +17,7 @@ import (
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
+	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/winfsp/cgofuse/fuse"
 )
 
@@ -24,27 +25,37 @@ const stagedDirName = "Staged"
 
 type stagedFileFuse struct {
 	*StagedFile
-	fetcher   *fetcher.Fetcher
-	fetcherMu sync.Mutex
-	openCount int
+	store   fetcher.BackingStore
+	storeMu sync.Mutex
 }
 
 type fuseFS struct {
 	mountpoint  string
 	mounted     bool
 	client      *api.Client
+	config      *config.Config
 	stagedFiles map[string]*stagedFileFuse
 	mu          sync.RWMutex
 	host        *fuse.FileSystemHost
 	ctx         context.Context
 	cancel      context.CancelFunc
+	
+	// File handle management
+	nextFH     uint64
+	fhToStore  map[uint64]fetcher.BackingStore
+	fhToPath   map[uint64]string
+	fhMu       sync.RWMutex
 }
 
-func newFS(client *api.Client) FS {
+func newFS(client *api.Client, cfg *config.Config) FS {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &fuseFS{
 		client:      client,
+		config:      cfg,
 		stagedFiles: make(map[string]*stagedFileFuse),
+		fhToStore:   make(map[uint64]fetcher.BackingStore),
+		fhToPath:    make(map[uint64]string),
+		nextFH:      1,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -290,41 +301,69 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
 		
 		if len(parts) == 2 {
-			fs.mu.Lock()
+			fs.mu.RLock()
 			sf, exists := fs.stagedFiles[parts[0]]
-			fs.mu.Unlock()
+			fs.mu.RUnlock()
 			
 			if exists && sf.FileName == parts[1] {
-				// Initialize fetcher on first open
-				sf.fetcherMu.Lock()
-				if sf.fetcher == nil {
-					log.Printf("Open: Initializing fetcher for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
+				// Initialize BackingStore on first open
+				sf.storeMu.Lock()
+				if sf.store == nil {
+					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
 						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
 						sf.Status = "error"
-						sf.fetcherMu.Unlock()
+						sf.storeMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
 					}
 					log.Printf("Open: Got temp URL for %s: %s", sf.FileName, tempURL)
 
-					f, err := fetcher.New(fs.ctx, tempURL, sf.Size)
+					// Create store options from config
+					storeOpts := fetcher.StoreOptions{
+						Mode:                  fetcher.FetchMode(fs.config.FetchMode),
+						TempDir:               fs.config.TempDir,
+						ChunkSize:             fs.config.ChunkSize,
+						MaxConcurrentRequests: fs.config.MaxConcurrentRequests,
+						CacheSize:             fs.config.CacheSize,
+					}
+					if storeOpts.ChunkSize == 0 {
+						storeOpts.ChunkSize = 4 * 1024 * 1024 // 4MB default
+					}
+					if storeOpts.MaxConcurrentRequests == 0 {
+						storeOpts.MaxConcurrentRequests = 4
+					}
+					if storeOpts.CacheSize == 0 {
+						storeOpts.CacheSize = 8
+					}
+
+					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
 					if err != nil {
-						log.Printf("Failed to create fetcher for %s: %v", sf.FileName, err)
+						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
 						sf.Status = "error"
-						sf.fetcherMu.Unlock()
+						sf.storeMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
 					}
 
-					sf.fetcher = f
+					sf.store = store
 					sf.Status = "open"
-					log.Printf("Open: Fetcher initialized successfully for %s", sf.FileName)
+					log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
 				}
-				sf.openCount++
-				log.Printf("Open: %s opened (openCount=%d)", sf.FileName, sf.openCount)
-				sf.fetcherMu.Unlock()
+				sf.storeMu.Unlock()
 				
-				return 0, 0
+				// Increment ref count and create file handle
+				sf.store.IncRef()
+				
+				fs.fhMu.Lock()
+				fh := fs.nextFH
+				fs.nextFH++
+				fs.fhToStore[fh] = sf.store
+				fs.fhToPath[fh] = path
+				fs.fhMu.Unlock()
+				
+				log.Printf("Open: %s opened (fh=%d, refCount=%d)", sf.FileName, fh, sf.store.RefCount())
+				
+				return 0, fh
 			}
 		}
 	}
@@ -333,86 +372,68 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
-	path = strings.TrimPrefix(path, "/")
+	// Get the backing store from the file handle
+	fs.fhMu.RLock()
+	store, exists := fs.fhToStore[fh]
+	filePath := fs.fhToPath[fh]
+	fs.fhMu.RUnlock()
 	
-	if strings.HasPrefix(path, stagedDirName+"/") {
-		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
-		
-		if len(parts) == 2 {
-			fs.mu.RLock()
-			sf, exists := fs.stagedFiles[parts[0]]
-			fs.mu.RUnlock()
-			
-			if exists && sf.FileName == parts[1] {
-				sf.fetcherMu.Lock()
-				f := sf.fetcher
-				if f == nil {
-					log.Printf("Read: %s fetcher is nil at offset %d", sf.FileName, ofst)
-					sf.fetcherMu.Unlock()
-					return -fuse.EIO
-				}
-				sf.Status = "reading"
-				sf.fetcherMu.Unlock()
-
-				log.Printf("Read: %s reading %d bytes at offset %d", sf.FileName, len(buff), ofst)
-				n, err := f.ReadAt(fs.ctx, buff, ofst)
-				
-				// Handle EOF correctly
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						log.Printf("Read: %s reached EOF at offset %d", sf.FileName, ofst)
-						sf.fetcherMu.Lock()
-						sf.Status = "done"
-						sf.fetcherMu.Unlock()
-						return 0
-					}
-					// For other errors, only fail if we read nothing
-					if n == 0 {
-						log.Printf("Read error for %s at offset %d: %v", sf.FileName, ofst, err)
-						sf.fetcherMu.Lock()
-						sf.Status = "error"
-						sf.fetcherMu.Unlock()
-						return -fuse.EIO
-					}
-					// If we got some data despite error, return the data
-					log.Printf("Partial read for %s at offset %d: read %d bytes with error: %v", sf.FileName, ofst, n, err)
-				} else {
-					log.Printf("Read: %s successfully read %d bytes at offset %d", sf.FileName, n, ofst)
-				}
-
-				return n
-			}
-		}
+	if !exists || store == nil {
+		log.Printf("Read: Invalid file handle %d", fh)
+		return -fuse.EBADF
 	}
 
-	return -fuse.ENOENT
+	// Extract filename for logging
+	fileName := filepath.Base(filePath)
+	
+	log.Printf("Read: %s reading %d bytes at offset %d (fh=%d)", fileName, len(buff), ofst, fh)
+	n, err := store.ReadAt(fs.ctx, buff, ofst)
+	
+	// Handle EOF correctly
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			log.Printf("Read: %s reached EOF at offset %d", fileName, ofst)
+			return 0
+		}
+		// For other errors, only fail if we read nothing
+		if n == 0 {
+			log.Printf("Read error for %s at offset %d: %v", fileName, ofst, err)
+			return -fuse.EIO
+		}
+		// If we got some data despite error, return the data
+		log.Printf("Partial read for %s at offset %d: read %d bytes with error: %v", fileName, ofst, n, err)
+	} else {
+		log.Printf("Read: %s successfully read %d bytes at offset %d", fileName, n, ofst)
+	}
+
+	return n
 }
 
 func (fs *fuseFS) Release(path string, fh uint64) int {
-	path = strings.TrimPrefix(path, "/")
+	// Get and remove the file handle mapping
+	fs.fhMu.Lock()
+	store, exists := fs.fhToStore[fh]
+	filePath := fs.fhToPath[fh]
+	delete(fs.fhToStore, fh)
+	delete(fs.fhToPath, fh)
+	fs.fhMu.Unlock()
 	
-	if strings.HasPrefix(path, stagedDirName+"/") {
-		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
-		
-		if len(parts) == 2 {
-			fs.mu.RLock()
-			sf, exists := fs.stagedFiles[parts[0]]
-			fs.mu.RUnlock()
-			
-			if exists && sf.FileName == parts[1] {
-				sf.fetcherMu.Lock()
-				sf.openCount--
-				
-				// Close fetcher when no more open handles
-				if sf.openCount == 0 && sf.fetcher != nil {
-					sf.fetcher.Close()
-					sf.fetcher = nil
-					if sf.Status != "error" {
-						sf.Status = "idle"
-					}
-				}
-				sf.fetcherMu.Unlock()
-			}
+	if !exists || store == nil {
+		log.Printf("Release: Invalid file handle %d", fh)
+		return -fuse.EBADF
+	}
+
+	fileName := filepath.Base(filePath)
+	
+	// Decrement ref count
+	newRefCount := store.DecRef()
+	log.Printf("Release: %s closed (fh=%d, newRefCount=%d)", fileName, fh, newRefCount)
+	
+	// If this was the last reference, close the store
+	if newRefCount == 0 {
+		log.Printf("Release: Closing backing store for %s", fileName)
+		if err := store.Close(); err != nil {
+			log.Printf("Release: Error closing store for %s: %v", fileName, err)
 		}
 	}
 

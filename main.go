@@ -70,7 +70,7 @@ func main() {
 	}()
 
 	// Start daemon services (FUSE mount) in background
-	if err := daemon.Start(ctx, cfg.Mountpoint, client); err != nil {
+	if err := daemon.Start(ctx, cfg.Mountpoint, client, cfg); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
 

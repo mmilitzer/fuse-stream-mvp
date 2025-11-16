@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 )
 
 // StagedFile represents a file staged for upload via FUSE mount
@@ -48,6 +49,6 @@ type FS interface {
 }
 
 // New creates a new FS instance (FUSE or stub based on build tags)
-func New(client *api.Client) FS {
-	return newFS(client)
+func New(client *api.Client, cfg *config.Config) FS {
+	return newFS(client, cfg)
 }

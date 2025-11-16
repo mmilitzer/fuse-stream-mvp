@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 )
 
 type stubFS struct {
@@ -18,7 +19,7 @@ type stubFS struct {
 	mu          sync.RWMutex
 }
 
-func newFS(client *api.Client) FS {
+func newFS(client *api.Client, cfg *config.Config) FS {
 	return &stubFS{
 		client:      client,
 		stagedFiles: make(map[string]*StagedFile),

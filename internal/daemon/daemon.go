@@ -10,6 +10,7 @@ import (
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fs"
+	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 )
 
 var (
@@ -23,7 +24,7 @@ type Daemon struct {
 	cancel context.CancelFunc
 }
 
-func Start(ctx context.Context, mountpoint string, client *api.Client) error {
+func Start(ctx context.Context, mountpoint string, client *api.Client, cfg *config.Config) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -40,7 +41,7 @@ func Start(ctx context.Context, mountpoint string, client *api.Client) error {
 
 	// Create and start filesystem (FUSE or stub based on build tags)
 	daemonCtx, cancel := context.WithCancel(ctx)
-	filesystem := fs.New(client)
+	filesystem := fs.New(client, cfg)
 	
 	if err := filesystem.Start(fs.MountOptions{Mountpoint: mountpoint}); err != nil {
 		cancel()
