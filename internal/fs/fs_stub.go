@@ -79,3 +79,17 @@ func (fs *stubFS) GetStagedFiles() []*StagedFile {
 func (fs *stubFS) GetFilePath(sf *StagedFile) string {
 	return fmt.Sprintf("(FUSE unavailable - build with -tags fuse)")
 }
+
+func (fs *stubFS) EvictStagedFile(id string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	delete(fs.stagedFiles, id)
+	return nil
+}
+
+func (fs *stubFS) EvictAllStagedFiles() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.stagedFiles = make(map[string]*StagedFile)
+	return nil
+}

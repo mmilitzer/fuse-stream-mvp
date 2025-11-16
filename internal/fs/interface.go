@@ -46,6 +46,14 @@ type FS interface {
 	
 	// GetFilePath returns the virtual path for a staged file
 	GetFilePath(sf *StagedFile) string
+	
+	// EvictStagedFile closes and removes a specific staged file's BackingStore.
+	// This should be called when the user stages a new file or leaves the detail screen.
+	EvictStagedFile(id string) error
+	
+	// EvictAllStagedFiles closes and removes all staged files' BackingStores.
+	// This should be called on app shutdown or when clearing all staged files.
+	EvictAllStagedFiles() error
 }
 
 // New creates a new FS instance (FUSE or stub based on build tags)

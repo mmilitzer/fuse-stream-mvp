@@ -215,6 +215,47 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 ---
 
+## BackingStore Lifecycle
+
+The BackingStore (cache) lifecycle is now **owned by the staged item**, not by FUSE refCount alone:
+
+### Current Behavior (Post-M2)
+
+- **Staging**: When `StageFile()` is called, a new BackingStore is created on first FUSE `Open()`.
+- **FUSE refCount**: Tracks active kernel file handles (multiple opens from browser, media player, etc.).
+  - `IncRef()` on each FUSE `Open()`
+  - `DecRef()` on each FUSE `Release()`
+  - RefCount hitting 0 does **NOT** trigger `Close()` anymore
+- **Persistence**: The BackingStore and its cache (temp file or LRU) remain alive as long as the staged item is visible in the UI.
+- **Explicit Eviction**: BackingStore is closed only at these points:
+  1. When staging a **new file** (evicts the previous one)
+  2. When the user calls `EvictStagedFile(id)` (e.g., leaving detail screen)
+  3. On **app shutdown** (`EvictAllStagedFiles()`)
+
+### Benefits
+
+- **Repeated uploads**: Dragging the same staged tile multiple times reuses the existing cache (no re-download in temp-file mode).
+- **Multi-handle support**: Browser can open/close the file multiple times during upload without cache loss.
+- **Single-tile MVP**: For this milestone, staging a new file automatically evicts the old one (max 1 temp file on disk).
+
+### Future Extensions
+
+- Multiple concurrent staged items (needs LRU eviction policy for temp files)
+- User-triggered eviction from UI ("Clear Cache" button)
+- Time-based eviction (evict after N minutes idle)
+
+### Testing
+
+See `internal/fetcher/store_lifecycle_test.go` for comprehensive tests covering:
+- Store survival across refCount going to 0
+- Reuse of same store on repeated open/read cycles
+- Explicit eviction behavior
+- Concurrent multi-handle access
+- Temp file lifecycle (TempFile mode)
+- Cache behavior (RangeLRU mode)
+
+---
+
 ## Notes
 
 - Browsers may perform non-linear reads; ensure Range and random access are correct.

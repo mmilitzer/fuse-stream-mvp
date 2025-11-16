@@ -149,3 +149,23 @@ func (a *App) StartNativeDrag(absPath string) error {
 
 	return drag.StartFileDrag(absPath)
 }
+
+// EvictStagedFile explicitly removes a staged file and closes its BackingStore.
+// This should be called when the user leaves the detail screen or cancels staging.
+func (a *App) EvictStagedFile(id string) error {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return fmt.Errorf("filesystem not available")
+	}
+	return filesystem.EvictStagedFile(id)
+}
+
+// EvictAllStagedFiles removes all staged files and closes their BackingStores.
+// This can be called when clearing all staged files or on app shutdown.
+func (a *App) EvictAllStagedFiles() error {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return fmt.Errorf("filesystem not available")
+	}
+	return filesystem.EvictAllStagedFiles()
+}

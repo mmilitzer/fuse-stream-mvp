@@ -99,6 +99,11 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 }
 
 func (fs *fuseFS) Stop() error {
+	// Evict all staged files to clean up BackingStores
+	if err := fs.EvictAllStagedFiles(); err != nil {
+		log.Printf("Stop: Error evicting staged files: %v", err)
+	}
+	
 	fs.cancel()
 	if fs.host != nil {
 		if !fs.host.Unmount() {
@@ -123,6 +128,13 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 
 	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
 	
+	// MVP limitation: only one staged file at a time
+	// Evict all previous staged files before staging a new one
+	for existingID := range fs.stagedFiles {
+		log.Printf("StageFile: Evicting previous staged file %s", existingID)
+		fs.evictStagedFileLocked(existingID)
+	}
+	
 	sf := &StagedFile{
 		ID:           id,
 		FileID:       fileID,
@@ -137,6 +149,7 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 	fs.stagedFiles[id] = &stagedFileFuse{
 		StagedFile: sf,
 	}
+	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s)", fileName, fileID, recipientTag)
 	return sf, nil
 }
 
@@ -153,6 +166,52 @@ func (fs *fuseFS) GetStagedFiles() []*StagedFile {
 
 func (fs *fuseFS) GetFilePath(stagedFile *StagedFile) string {
 	return filepath.Join(fs.mountpoint, stagedDirName, stagedFile.ID, stagedFile.FileName)
+}
+
+func (fs *fuseFS) EvictStagedFile(id string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.evictStagedFileLocked(id)
+}
+
+func (fs *fuseFS) EvictAllStagedFiles() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	
+	var firstErr error
+	for id := range fs.stagedFiles {
+		if err := fs.evictStagedFileLocked(id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// evictStagedFileLocked closes the BackingStore and removes the staged file from the registry.
+// Caller must hold fs.mu lock.
+func (fs *fuseFS) evictStagedFileLocked(id string) error {
+	sff, exists := fs.stagedFiles[id]
+	if !exists {
+		return nil
+	}
+	
+	// Close the BackingStore if it exists
+	sff.storeMu.Lock()
+	if sff.store != nil {
+		log.Printf("EvictStagedFile: Closing BackingStore for %s (refCount=%d)", id, sff.store.RefCount())
+		if err := sff.store.Close(); err != nil {
+			log.Printf("EvictStagedFile: Error closing store for %s: %v", id, err)
+			sff.storeMu.Unlock()
+			return err
+		}
+		sff.store = nil
+	}
+	sff.storeMu.Unlock()
+	
+	// Remove from registry
+	delete(fs.stagedFiles, id)
+	log.Printf("EvictStagedFile: Removed %s from registry", id)
+	return nil
 }
 
 // FUSE operations
@@ -425,17 +484,11 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 
 	fileName := filepath.Base(filePath)
 	
-	// Decrement ref count
+	// Decrement ref count (but do NOT auto-close)
+	// The BackingStore lifecycle is now owned by the staged item, not FUSE refCount.
+	// Close() will be called only from explicit eviction points.
 	newRefCount := store.DecRef()
-	log.Printf("Release: %s closed (fh=%d, newRefCount=%d)", fileName, fh, newRefCount)
-	
-	// If this was the last reference, close the store
-	if newRefCount == 0 {
-		log.Printf("Release: Closing backing store for %s", fileName)
-		if err := store.Close(); err != nil {
-			log.Printf("Release: Error closing store for %s: %v", fileName, err)
-		}
-	}
+	log.Printf("Release: %s closed (fh=%d, newRefCount=%d) - store remains alive", fileName, fh, newRefCount)
 
 	return 0
 }
