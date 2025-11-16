@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -179,6 +180,10 @@ func (fs *fuseFS) Access(path string, mask uint32) int {
 func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	path = strings.TrimPrefix(path, "/")
 	
+	// Set ownership to current user (prevents root ownership and admin:/// prompts)
+	stat.Uid = uint32(os.Getuid())
+	stat.Gid = uint32(os.Getgid())
+	
 	// Root directory
 	if path == "" {
 		stat.Mode = fuse.S_IFDIR | 0755
@@ -215,7 +220,7 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 			fs.mu.RUnlock()
 			
 			if exists && sf.FileName == parts[1] {
-				stat.Mode = fuse.S_IFREG | 0444
+				stat.Mode = fuse.S_IFREG | 0644
 				stat.Nlink = 1
 				stat.Size = sf.Size
 				stat.Mtim = fuse.NewTimespec(sf.ModTime)
