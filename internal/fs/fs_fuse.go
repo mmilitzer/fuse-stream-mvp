@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
@@ -27,6 +28,13 @@ type stagedFileFuse struct {
 	*StagedFile
 	store   fetcher.BackingStore
 	storeMu sync.Mutex
+	
+	// Two-ref tracking for lifecycle:
+	// - tileRef: 1 when tile is visible/staged, 0 when replaced or hidden
+	// - openRef: count of active FUSE handles (Open/Release)
+	// Eviction only happens when both are 0
+	tileRef int32
+	openRef int32
 }
 
 type fuseFS struct {
@@ -41,23 +49,25 @@ type fuseFS struct {
 	cancel      context.CancelFunc
 	
 	// File handle management
-	nextFH     uint64
-	fhToStore  map[uint64]fetcher.BackingStore
-	fhToPath   map[uint64]string
-	fhMu       sync.RWMutex
+	nextFH        uint64
+	fhToStore     map[uint64]fetcher.BackingStore
+	fhToPath      map[uint64]string
+	fhToStagedID  map[uint64]string  // Maps file handle to staged file ID
+	fhMu          sync.RWMutex
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &fuseFS{
-		client:      client,
-		config:      cfg,
-		stagedFiles: make(map[string]*stagedFileFuse),
-		fhToStore:   make(map[uint64]fetcher.BackingStore),
-		fhToPath:    make(map[uint64]string),
-		nextFH:      1,
-		ctx:         ctx,
-		cancel:      cancel,
+		client:       client,
+		config:       cfg,
+		stagedFiles:  make(map[string]*stagedFileFuse),
+		fhToStore:    make(map[uint64]fetcher.BackingStore),
+		fhToPath:     make(map[uint64]string),
+		fhToStagedID: make(map[uint64]string),
+		nextFH:       1,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -129,10 +139,12 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
 	
 	// MVP limitation: only one staged file at a time
-	// Evict all previous staged files before staging a new one
-	for existingID := range fs.stagedFiles {
-		log.Printf("StageFile: Evicting previous staged file %s", existingID)
-		fs.evictStagedFileLocked(existingID)
+	// Clear tileRef for all previous staged files (but don't close if they have active uploads)
+	for existingID, sff := range fs.stagedFiles {
+		log.Printf("StageFile: Clearing tileRef for previous staged file %s", existingID)
+		atomic.StoreInt32(&sff.tileRef, 0)
+		// Try to evict immediately if no active FUSE handles
+		fs.tryEvictLocked(existingID)
 	}
 	
 	sf := &StagedFile{
@@ -146,10 +158,13 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 		Status:       "idle",
 	}
 
-	fs.stagedFiles[id] = &stagedFileFuse{
+	sff := &stagedFileFuse{
 		StagedFile: sf,
+		tileRef:    1, // Tile is now visible
+		openRef:    0, // No FUSE handles yet
 	}
-	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s)", fileName, fileID, recipientTag)
+	fs.stagedFiles[id] = sff
+	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s, tileRef=1, openRef=0)", fileName, fileID, recipientTag)
 	return sf, nil
 }
 
@@ -171,38 +186,66 @@ func (fs *fuseFS) GetFilePath(stagedFile *StagedFile) string {
 func (fs *fuseFS) EvictStagedFile(id string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fs.evictStagedFileLocked(id)
+	
+	sff, exists := fs.stagedFiles[id]
+	if !exists {
+		return nil
+	}
+	
+	// Clear tileRef and try to evict
+	log.Printf("EvictStagedFile: Clearing tileRef for %s", id)
+	atomic.StoreInt32(&sff.tileRef, 0)
+	fs.tryEvictLocked(id)
+	return nil
 }
 
 func (fs *fuseFS) EvictAllStagedFiles() error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	
-	var firstErr error
-	for id := range fs.stagedFiles {
-		if err := fs.evictStagedFileLocked(id); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	// Clear tileRef for all staged files and try to evict each
+	for id, sff := range fs.stagedFiles {
+		log.Printf("EvictAllStagedFiles: Clearing tileRef for %s", id)
+		atomic.StoreInt32(&sff.tileRef, 0)
+		fs.tryEvictLocked(id)
 	}
-	return firstErr
+	return nil
 }
 
-// evictStagedFileLocked closes the BackingStore and removes the staged file from the registry.
+// tryEvictLocked attempts to evict a staged file if both tileRef and openRef are 0.
 // Caller must hold fs.mu lock.
-func (fs *fuseFS) evictStagedFileLocked(id string) error {
+func (fs *fuseFS) tryEvictLocked(id string) {
 	sff, exists := fs.stagedFiles[id]
 	if !exists {
-		return nil
+		return
+	}
+	
+	tileRef := atomic.LoadInt32(&sff.tileRef)
+	openRef := atomic.LoadInt32(&sff.openRef)
+	
+	// Only evict if both refs are 0
+	if tileRef == 0 && openRef == 0 {
+		log.Printf("tryEvictLocked: Both refs are 0, evicting %s", id)
+		fs.doEvictLocked(id)
+	} else {
+		log.Printf("tryEvictLocked: Cannot evict %s yet (tileRef=%d, openRef=%d)", id, tileRef, openRef)
+	}
+}
+
+// doEvictLocked unconditionally closes the BackingStore and removes the staged file.
+// Caller must hold fs.mu lock.
+func (fs *fuseFS) doEvictLocked(id string) {
+	sff, exists := fs.stagedFiles[id]
+	if !exists {
+		return
 	}
 	
 	// Close the BackingStore if it exists
 	sff.storeMu.Lock()
 	if sff.store != nil {
-		log.Printf("EvictStagedFile: Closing BackingStore for %s (refCount=%d)", id, sff.store.RefCount())
+		log.Printf("doEvictLocked: Closing BackingStore for %s (refCount=%d)", id, sff.store.RefCount())
 		if err := sff.store.Close(); err != nil {
-			log.Printf("EvictStagedFile: Error closing store for %s: %v", id, err)
-			sff.storeMu.Unlock()
-			return err
+			log.Printf("doEvictLocked: Error closing store for %s: %v", id, err)
 		}
 		sff.store = nil
 	}
@@ -210,8 +253,7 @@ func (fs *fuseFS) evictStagedFileLocked(id string) error {
 	
 	// Remove from registry
 	delete(fs.stagedFiles, id)
-	log.Printf("EvictStagedFile: Removed %s from registry", id)
-	return nil
+	log.Printf("doEvictLocked: Removed %s from registry", id)
 }
 
 // FUSE operations
@@ -408,19 +450,24 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 					sf.Status = "open"
 					log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
 				}
-				sf.storeMu.Unlock()
 				
-				// Increment ref count and create file handle
+				// Increment both openRef (our tracking) and BackingStore refCount
+				newOpenRef := atomic.AddInt32(&sf.openRef, 1)
 				sf.store.IncRef()
+				stagedID := sf.ID  // Capture ID before unlocking
+				sf.storeMu.Unlock()
 				
 				fs.fhMu.Lock()
 				fh := fs.nextFH
 				fs.nextFH++
 				fs.fhToStore[fh] = sf.store
 				fs.fhToPath[fh] = path
+				fs.fhToStagedID[fh] = stagedID  // Store staged file ID for Release
 				fs.fhMu.Unlock()
 				
-				log.Printf("Open: %s opened (fh=%d, refCount=%d)", sf.FileName, fh, sf.store.RefCount())
+				tileRef := atomic.LoadInt32(&sf.tileRef)
+				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
+					sf.FileName, fh, tileRef, newOpenRef, sf.store.RefCount())
 				
 				return 0, fh
 			}
@@ -473,8 +520,10 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	fs.fhMu.Lock()
 	store, exists := fs.fhToStore[fh]
 	filePath := fs.fhToPath[fh]
+	stagedID := fs.fhToStagedID[fh]
 	delete(fs.fhToStore, fh)
 	delete(fs.fhToPath, fh)
+	delete(fs.fhToStagedID, fh)
 	fs.fhMu.Unlock()
 	
 	if !exists || store == nil {
@@ -484,11 +533,31 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 
 	fileName := filepath.Base(filePath)
 	
-	// Decrement ref count (but do NOT auto-close)
-	// The BackingStore lifecycle is now owned by the staged item, not FUSE refCount.
-	// Close() will be called only from explicit eviction points.
-	newRefCount := store.DecRef()
-	log.Printf("Release: %s closed (fh=%d, newRefCount=%d) - store remains alive", fileName, fh, newRefCount)
+	// Decrement both BackingStore refCount and openRef
+	newStoreRefCount := store.DecRef()
+	
+	// Decrement openRef and check if we should evict
+	fs.mu.RLock()
+	sff, sfExists := fs.stagedFiles[stagedID]
+	fs.mu.RUnlock()
+	
+	if sfExists {
+		newOpenRef := atomic.AddInt32(&sff.openRef, -1)
+		tileRef := atomic.LoadInt32(&sff.tileRef)
+		log.Printf("Release: %s closed (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
+			fileName, fh, tileRef, newOpenRef, newStoreRefCount)
+		
+		// If both refs are 0, try to evict
+		if tileRef == 0 && newOpenRef == 0 {
+			log.Printf("Release: Both refs are 0 for %s, attempting eviction", stagedID)
+			fs.mu.Lock()
+			fs.tryEvictLocked(stagedID)
+			fs.mu.Unlock()
+		}
+	} else {
+		log.Printf("Release: %s closed (fh=%d, storeRefCount=%d) - staged file no longer exists", 
+			fileName, fh, newStoreRefCount)
+	}
 
 	return 0
 }

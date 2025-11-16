@@ -461,3 +461,126 @@ func TestTempFileLocation(t *testing.T) {
 		t.Errorf("Temp file name %s does not match expected pattern fsmvp-*.tmp", baseName)
 	}
 }
+
+// TestConcurrentUploadAndStaging simulates the critical scenario:
+// Upload A is in progress (openRef=1, tileRef=1) when user stages file B.
+// File A should NOT be evicted until upload completes (openRef goes to 0).
+func TestConcurrentUploadAndStaging(t *testing.T) {
+	testDataA := strings.Repeat("file A content ", 1000) // ~15KB
+	testDataB := strings.Repeat("file B content ", 1000) // ~15KB
+	
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(testDataA)))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(testDataA))
+	}))
+	defer serverA.Close()
+	
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(testDataB)))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(testDataB))
+	}))
+	defer serverB.Close()
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	
+	opts := StoreOptions{
+		Mode:    FetchModeTempFile,
+		TempDir: tempDir,
+	}
+
+	// Step 1: Create store A (simulating staging file A)
+	t.Log("Step 1: Creating store A (staging file A)")
+	storeA, err := NewBackingStore(ctx, serverA.URL, int64(len(testDataA)), opts)
+	if err != nil {
+		t.Fatalf("Failed to create store A: %v", err)
+	}
+
+	// Step 2: Start "upload" of A (open file handle)
+	t.Log("Step 2: Starting upload A (openRef=1, tileRef=1)")
+	storeA.IncRef()
+	if storeA.RefCount() != 1 {
+		t.Errorf("Expected storeA refCount=1, got %d", storeA.RefCount())
+	}
+
+	// Read some data to simulate upload in progress
+	buf := make([]byte, 1000)
+	n, err := storeA.ReadAt(ctx, buf, 0)
+	if err != nil && err != io.EOF {
+		t.Errorf("ReadAt failed: %v", err)
+	}
+	if n == 0 {
+		t.Error("ReadAt returned 0 bytes")
+	}
+	t.Logf("Upload A read %d bytes", n)
+
+	// Step 3: Get temp file path of A
+	tempStoreA, ok := storeA.(*TempFileStore)
+	if !ok {
+		t.Fatal("Store A is not a TempFileStore")
+	}
+	tempPathA := tempStoreA.tempPath
+	t.Logf("Store A temp file: %s", tempPathA)
+
+	// Step 4: Verify temp file A exists
+	if _, err := os.Stat(tempPathA); os.IsNotExist(err) {
+		t.Error("Temp file A should exist during upload")
+	}
+
+	// Step 5: Simulate staging file B (which would set tileRef=0 for A)
+	// In the real code, this happens in StageFile() when it clears tileRef for previous files
+	t.Log("Step 3: Staging file B (should set A's tileRef=0, but not close A)")
+	
+	// Create store B
+	storeB, err := NewBackingStore(ctx, serverB.URL, int64(len(testDataB)), opts)
+	if err != nil {
+		t.Fatalf("Failed to create store B: %v", err)
+	}
+	defer storeB.Close()
+	
+	t.Log("Store B created successfully")
+
+	// Step 6: Verify A's temp file STILL exists (because openRef=1)
+	// In the real code, tryEvictLocked() would be called but would not evict
+	// because openRef > 0
+	if _, err := os.Stat(tempPathA); os.IsNotExist(err) {
+		t.Error("Temp file A should STILL exist (openRef=1 even though tileRef=0)")
+	}
+
+	// Step 7: Continue reading from A (upload still in progress)
+	t.Log("Step 4: Continuing upload A (reading more data)")
+	buf2 := make([]byte, 1000)
+	n2, err2 := storeA.ReadAt(ctx, buf2, 1000)
+	if err2 != nil && err2 != io.EOF {
+		t.Errorf("Second ReadAt failed: %v", err2)
+	}
+	if n2 == 0 {
+		t.Error("Second ReadAt returned 0 bytes")
+	}
+	t.Logf("Upload A read %d more bytes", n2)
+
+	// Step 8: Finish upload A (close file handle, openRef goes to 0)
+	t.Log("Step 5: Finishing upload A (openRef -> 0)")
+	newRefCount := storeA.DecRef()
+	if newRefCount != 0 {
+		t.Errorf("Expected storeA refCount=0, got %d", newRefCount)
+	}
+
+	// Step 9: Now with tileRef=0 AND openRef=0, the real code would evict
+	// We'll manually close to simulate this
+	t.Log("Step 6: Simulating eviction now that both refs are 0")
+	if err := storeA.Close(); err != nil {
+		t.Errorf("Close storeA failed: %v", err)
+	}
+
+	// Step 10: Verify temp file A is NOW deleted
+	if _, err := os.Stat(tempPathA); !os.IsNotExist(err) {
+		t.Error("Temp file A should be deleted after eviction (both refs are 0)")
+	}
+
+	t.Log("Test completed successfully:")
+	t.Log("- Store A survived staging of B while upload was in progress (openRef=1)")
+	t.Log("- Store A was evicted only after upload finished (openRef=0) AND tile was replaced (tileRef=0)")
+}

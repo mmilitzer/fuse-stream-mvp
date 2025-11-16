@@ -217,20 +217,52 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 ## BackingStore Lifecycle
 
-The BackingStore (cache) lifecycle is now **owned by the staged item**, not by FUSE refCount alone:
+The BackingStore (cache) lifecycle uses a **two-reference counting system** to handle concurrent uploads and staging:
 
-### Current Behavior (Post-M2)
+### Two-Ref System
 
-- **Staging**: When `StageFile()` is called, a new BackingStore is created on first FUSE `Open()`.
-- **FUSE refCount**: Tracks active kernel file handles (multiple opens from browser, media player, etc.).
-  - `IncRef()` on each FUSE `Open()`
-  - `DecRef()` on each FUSE `Release()`
-  - RefCount hitting 0 does **NOT** trigger `Close()` anymore
-- **Persistence**: The BackingStore and its cache (temp file or LRU) remain alive as long as the staged item is visible in the UI.
-- **Explicit Eviction**: BackingStore is closed only at these points:
-  1. When staging a **new file** (evicts the previous one)
-  2. When the user calls `EvictStagedFile(id)` (e.g., leaving detail screen)
-  3. On **app shutdown** (`EvictAllStagedFiles()`)
+Each staged file tracks two independent reference counts:
+
+1. **tileRef** (UI reference):
+   - `1` when the tile is visible/staged in the UI
+   - `0` when the tile is replaced or hidden
+   - Set by `StageFile()` and `EvictStagedFile()`
+
+2. **openRef** (FUSE handle count):
+   - Incremented on each FUSE `Open()` (browser opens the file)
+   - Decremented on each FUSE `Release()` (browser closes the file)
+   - Tracks active file handles from the OS/browser
+
+### Eviction Rule
+
+**BackingStore is closed and temp file deleted ONLY when BOTH refs are 0.**
+
+This prevents the critical bug where staging a new file would delete the temp file of an in-progress upload.
+
+### Behavior
+
+- **Staging a new file**:
+  - Sets `tileRef=0` for previous staged file
+  - Does **NOT** close if `openRef > 0` (upload in progress)
+  - Creates new file with `tileRef=1, openRef=0`
+
+- **FUSE Open/Release**:
+  - `Open()`: `openRef++` (and BackingStore.IncRef())
+  - `Release()`: `openRef--` (and BackingStore.DecRef())
+  - On `Release()` with `openRef==0 && tileRef==0`: evict
+
+- **Explicit eviction** (user action or app shutdown):
+  - Sets `tileRef=0`
+  - Evicts only if `openRef==0`
+  - Waits for active uploads to complete
+
+### Example Timeline
+
+1. **Stage file A**: `tileRef=1, openRef=0`
+2. **Browser opens A**: `tileRef=1, openRef=1` (upload starts)
+3. **User stages file B**: A gets `tileRef=0, openRef=1` (still uploading → NOT evicted)
+4. **Browser closes A**: A gets `tileRef=0, openRef=0` → **evicted now**
+5. **File B remains**: `tileRef=1, openRef=0` (ready for next upload)
 
 ### Benefits
 
