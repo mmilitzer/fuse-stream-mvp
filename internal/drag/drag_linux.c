@@ -110,12 +110,10 @@ int FSMVP_StartFileDrag(const char* path) {
     gtk_window_set_type_hint(GTK_WINDOW(ctx.window), GDK_WINDOW_TYPE_HINT_UTILITY);
     
     // Create an event box to capture mouse events
+    // No need for any child widget - the event box itself is sufficient for drag initiation
     ctx.event_box = gtk_event_box_new();
     gtk_widget_add_events(ctx.event_box, GDK_BUTTON_PRESS_MASK);
-    
-    // Create an icon as the drag source
-    GtkWidget *icon = gtk_image_new_from_icon_name("text-x-generic", GTK_ICON_SIZE_DIALOG);
-    gtk_container_add(GTK_CONTAINER(ctx.event_box), icon);
+    gtk_widget_set_size_request(ctx.event_box, 64, 64);
     gtk_container_add(GTK_CONTAINER(ctx.window), ctx.event_box);
     
     // Set up the drag source with text/uri-list target
