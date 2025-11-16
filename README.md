@@ -58,10 +58,12 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 ## Repo layout (target)
 
 ```
-/cmd/app/                  # entrypoint: starts mount + launches UI
+/main.go                   # entrypoint: starts mount + launches UI
+/frontend/                 # static HTML frontend (embedded at build time)
 /internal/api/             # MediaHub API client (OAuth, jobs, downloads)
 /internal/fetcher/         # HTTP Range fetcher with bounded readahead + LRU seek cache
 /internal/fs/              # FUSE RO FS (cgofuse) exposing /Staged
+/internal/daemon/          # daemon lifecycle management
 /ui/                       # Wails app (frontend + bindings)
 /pkg/config/               # config loader (toml + env overrides), no token persistence
 ```
@@ -98,28 +100,84 @@ Environment variable overrides (take precedence):
 
 ### Build
 
-We gate mount-specific code behind build tags so CI can build without FUSE headers:
+**Important:** Wails applications **must** be built using the `wails` CLI (not `go build`) to include the required build tags.
 
 ```bash
-# Core (no mount) compiles everywhere
-go build ./...
+# Install Wails CLI
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-# Build with FUSE support locally
-go build -tags fuse ./cmd/app
+# Production build (GUI app)
+wails build -skipbindings
+
+# Binaries will be in build/bin/
+# - Linux: build/bin/fuse-stream-mvp
+# - macOS: build/bin/fuse-stream-mvp.app
+
+# Headless build (for dev/testing, no GUI)
+go build -tags fuse -o fuse-stream-mvp-headless .
 ```
 
 ### Run (local)
 
+**Option 1: Development mode (recommended)**
+
 ```bash
-# 1) Ensure config.toml exists (see above).
-# 2) Start the app (mount + UI):
-./app
+# Ensure config.toml exists (see above)
+wails dev
 ```
 
-The app mounts (e.g., `/Volumes/FuseStream`) and opens a window:
+This launches the app with hot-reload for frontend changes and proper build tags.
+
+**Option 2: Production build**
+
+```bash
+# Build first
+wails build -skipbindings
+
+# Then run
+./build/bin/fuse-stream-mvp              # Linux
+# or
+open ./build/bin/fuse-stream-mvp.app     # macOS
+```
+
+**Option 3: Headless mode (no GUI)**
+
+```bash
+# Build with FUSE support
+go build -tags fuse -o fuse-stream-mvp-headless .
+
+# Run without GUI (daemon only)
+./fuse-stream-mvp-headless --headless
+```
+
+This starts the daemon (FUSE mount + HTTP server) without launching a window. Useful for CI or manual testing.
+
+The GUI app mounts (e.g., `/Volumes/FuseStream`) and opens a window:
 - List jobs → pick output (if multiple) → enter recipient id → **Stage for upload**
 - A file appears in `Staged/` and a big draggable tile is shown.
-- Drag the tile into the target site’s upload zone; upload continues in background.
+- Drag the tile into the target site's upload zone; upload continues in background.
+
+### Testing
+
+**Unit tests** (with mock server, no credentials required):
+```bash
+go test ./...
+```
+
+**Live contract tests** (requires real MediaHub credentials):
+```bash
+export MEDIAHUB_CLIENT_ID="your_client_id"
+export MEDIAHUB_CLIENT_SECRET="your_client_secret"
+go test -v ./internal/api -run TestLive
+```
+
+The live tests validate:
+- OAuth token acquisition
+- Jobs list with `status=SUCCESS` filter
+- Download URL generation with `autograph_tag`
+
+In CI, live tests run automatically on push and pull requests, using repository secrets.
+
 
 ---
 

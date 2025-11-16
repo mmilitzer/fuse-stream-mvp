@@ -4,8 +4,27 @@ on:
   pull_request:
 
 jobs:
+  unit-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+      - name: Unit tests
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
+        run: go test ./... -run Test -v
+
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -13,21 +32,28 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - name: Build (no FUSE tag)
-        run: go build ./...
-      - name: Unit tests
-        env:
-          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
-          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
-        run: go test ./... -run Test -v || true
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libnss3-dev \
+            libayatana-appindicator3-dev
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Build Wails GUI app
+        run: |
+          wails build -skipbindings -platform linux/amd64
+      - name: Build headless binary (for dev/testing)
+        run: |
+          mkdir -p build/bin
+          go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-artifacts
-          path: |
-            **/*.go
-            go.mod
-            go.sum
+          name: linux-build
+          path: build/bin/**
 
   build-macos:
     runs-on: macos-latest
@@ -38,13 +64,35 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - name: Build (no FUSE tag)
-        run: go build ./...
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Build Wails GUI app
+        run: |
+          wails build -skipbindings -platform darwin/universal
+      - name: Build headless binary (for dev/testing)
+        run: |
+          mkdir -p build/bin
+          CGO_ENABLED=1 go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-artifacts
-          path: |
-            **/*.go
-            go.mod
-            go.sum
+          name: macos-build
+          path: build/bin/**
+
+  live-contract-tests:
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+      || github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run live tests
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
+        run: go test ./internal/api -run Live -v

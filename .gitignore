@@ -10,3 +10,8 @@ node_modules/
 /ui/build/
 /ui/node_modules/
 /ui/dist/
+/cmd/app/app
+/cmd/app/app.exe
+config.toml
+/frontend/dist/
+/frontend/node_modules/

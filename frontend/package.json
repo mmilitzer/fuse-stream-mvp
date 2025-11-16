@@ -1,0 +1,10 @@
+{
+  "name": "fuse-stream-mvp-frontend",
+  "version": "0.1.0",
+  "description": "Embedded frontend for FuseStream MVP",
+  "scripts": {
+    "build": "mkdir -p dist && cp index.html dist/",
+    "dev": "echo 'Using static HTML - no dev server needed'",
+    "install": "echo 'No dependencies to install'"
+  }
+}
