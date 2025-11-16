@@ -15,17 +15,17 @@ type Config struct {
 	Mountpoint   string `toml:"mountpoint"`
 	
 	// Fetch mode configuration
-	FetchMode             string `toml:"fetch_mode"`              // "range-lru" or "temp-file"
-	TempDir               string `toml:"temp_dir"`                // directory for temp files
+	FetchMode             string `toml:"fetch_mode"`              // "temp-file" (default, recommended) or "range-lru" (experimental)
+	TempDir               string `toml:"temp_dir"`                // directory for temp files (temp-file mode only)
 	ChunkSize             int    `toml:"chunk_size"`              // chunk size in bytes
 	MaxConcurrentRequests int    `toml:"max_concurrent_requests"` // max concurrent HTTP requests
-	CacheSize             int    `toml:"cache_size"`              // LRU cache size in chunks
+	CacheSize             int    `toml:"cache_size"`              // LRU cache size in chunks (range-lru mode only)
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
 		APIBase:               "https://api.xvid.com/v1",
-		FetchMode:             "range-lru", // default
+		FetchMode:             "temp-file", // default (range-lru is experimental)
 		ChunkSize:             4194304,     // 4MB default
 		MaxConcurrentRequests: 4,
 		CacheSize:             8,

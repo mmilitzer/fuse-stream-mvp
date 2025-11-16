@@ -61,7 +61,7 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 /main.go                   # entrypoint: starts mount + launches UI
 /frontend/                 # static HTML frontend (embedded at build time)
 /internal/api/             # MediaHub API client (OAuth, jobs, downloads)
-/internal/fetcher/         # HTTP Range fetcher with bounded readahead + LRU seek cache
+/internal/fetcher/         # HTTP Range fetcher (temp-file default, range-lru experimental)
 /internal/fs/              # FUSE RO FS (cgofuse) exposing /Staged
 /internal/daemon/          # daemon lifecycle management
 /ui/                       # Wails app (frontend + bindings)
@@ -81,6 +81,11 @@ client_secret = "YOUR_CLIENT_SECRET"
 
 # Optional runtime overrides:
 mountpoint = "/Volumes/FuseStream"   # macOS default; e.g. "/mnt/fusestream" on Linux
+
+# Fetch mode (optional):
+fetch_mode = "temp-file"   # default: downloads entire file to temp dir (reliable, recommended)
+                           # experimental: "range-lru" (streams chunks on-demand, memory-based cache)
+temp_dir = "/tmp"          # temp file directory (only used in temp-file mode)
 ```
 
 Environment variable overrides (take precedence):
@@ -88,8 +93,26 @@ Environment variable overrides (take precedence):
 - `FSMVP_CLIENT_ID`
 - `FSMVP_CLIENT_SECRET`
 - `FSMVP_MOUNTPOINT`
+- `FSMVP_FETCH_MODE` (`temp-file` or `range-lru`)
+- `FSMVP_TEMP_DIR`
 
 > The short‑lived **OAuth token is cached in memory only**.
+
+### Fetch Modes
+
+**`temp-file` (default, recommended)**:
+- Downloads the entire file to a temporary file on first open
+- Subsequent reads are served from disk (fast, reliable)
+- Temp file persists until both UI staging and FUSE handles are closed (see BackingStore Lifecycle)
+- Best for: MVP use case, repeated uploads, stable performance
+
+**`range-lru` (experimental)**:
+- Streams 4MB chunks on-demand via HTTP Range requests
+- LRU cache keeps 8 chunks (~32MB) in memory
+- No disk usage, but may be slower for non-sequential access
+- Best for: memory-constrained environments, testing
+
+For most users, the default `temp-file` mode is recommended.
 
 ---
 
@@ -196,7 +219,9 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 ### M2 — FUSE mount + staging
 - Implement read-only FUSE FS (cgofuse) exposing `Staged/` and mapping staged items to fixed-size files.
-- HTTP Range fetcher with bounded readahead, LRU seek cache, and retries; supports non-linear reads.
+- HTTP Range fetcher with two modes:
+  - **temp-file** (default): downloads entire file to temp dir on first open (reliable, recommended)
+  - **range-lru** (experimental): streams 4MB chunks on-demand with LRU cache
 - Wire UI: “Stage for upload” adds/removes items; show progress (bytes served vs. total).
 - **Acceptance:** dragging the staged file into a browser upload zone starts an upload; overlapping transfer observed on a large test file.
 
