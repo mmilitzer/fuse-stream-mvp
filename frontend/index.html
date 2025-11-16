@@ -235,7 +235,9 @@
             window.go.ui.App.StageForUpload({
                 fileId: selectedOutput.fileId,
                 fileName: selectedOutput.fileName,
-                recipientTag: recipientTag
+                recipientTag: recipientTag,
+                size: selectedOutput.size,
+                contentType: selectedOutput.contentType
             })
             .then(resp => {
                 if (resp.success) {

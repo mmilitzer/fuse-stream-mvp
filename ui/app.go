@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 )
 
 type App struct {
@@ -64,6 +65,8 @@ type StageRequest struct {
 	FileID       string `json:"fileId"`
 	FileName     string `json:"fileName"`
 	RecipientTag string `json:"recipientTag"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"contentType"`
 }
 
 type StageResponse struct {
@@ -73,10 +76,59 @@ type StageResponse struct {
 }
 
 func (a *App) StageForUpload(req StageRequest) StageResponse {
-	// M1: stub only - actual staging happens in M2
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return StageResponse{
+			Success: false,
+			Message: "Filesystem not mounted",
+		}
+	}
+
+	stagedFile, err := filesystem.StageFile(req.FileID, req.FileName, req.RecipientTag, req.Size, req.ContentType)
+	if err != nil {
+		return StageResponse{
+			Success: false,
+			Message: "Failed to stage file: " + err.Error(),
+		}
+	}
+
+	filePath := filesystem.GetFilePath(stagedFile)
+	
 	return StageResponse{
 		Success:  true,
-		FilePath: "/Volumes/FuseStream/Staged/" + req.FileName,
-		Message:  "Staged (stub in M1)",
+		FilePath: filePath,
+		Message:  "File staged successfully",
 	}
+}
+
+type StagedFileInfo struct {
+	ID           string `json:"id"`
+	FileName     string `json:"fileName"`
+	FilePath     string `json:"filePath"`
+	Size         int64  `json:"size"`
+	RecipientTag string `json:"recipientTag"`
+	Status       string `json:"status"`
+}
+
+func (a *App) GetStagedFiles() []StagedFileInfo {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return []StagedFileInfo{}
+	}
+
+	stagedFiles := filesystem.GetStagedFiles()
+	result := make([]StagedFileInfo, 0, len(stagedFiles))
+	
+	for _, sf := range stagedFiles {
+		result = append(result, StagedFileInfo{
+			ID:           sf.ID,
+			FileName:     sf.FileName,
+			FilePath:     filesystem.GetFilePath(sf),
+			Size:         sf.Size,
+			RecipientTag: sf.RecipientTag,
+			Status:       sf.Status,
+		})
+	}
+	
+	return result
 }

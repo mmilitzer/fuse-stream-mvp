@@ -19,7 +19,11 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/ui"
 )
 
-var headless = flag.Bool("headless", false, "Run in headless mode (no GUI, daemon only)")
+var (
+	headless = flag.Bool("headless", false, "Run in headless mode (no GUI, daemon only)")
+	mount    = flag.Bool("mount", false, "Mount the filesystem and exit")
+	unmount  = flag.Bool("unmount", false, "Unmount the filesystem and exit")
+)
 
 func main() {
 	flag.Parse()
@@ -27,6 +31,22 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Handle --unmount flag
+	if *unmount {
+		log.Printf("Unmounting filesystem at %s...", cfg.Mountpoint)
+		// Try to unmount using fusermount (Linux) or umount (macOS)
+		cmd := "fusermount"
+		args := []string{"-u", cfg.Mountpoint}
+		if err := syscall.Exec("/usr/bin/"+cmd, append([]string{cmd}, args...), os.Environ()); err != nil {
+			// Try umount on macOS
+			cmd = "umount"
+			if err := syscall.Exec("/sbin/"+cmd, append([]string{cmd}, cfg.Mountpoint), os.Environ()); err != nil {
+				log.Fatalf("Failed to unmount: %v", err)
+			}
+		}
+		return
 	}
 
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
@@ -37,6 +57,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Create API client
+	client := api.NewClient(cfg.APIBase, cfg.ClientID, cfg.ClientSecret)
+
 	// Handle OS signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -46,9 +69,16 @@ func main() {
 		cancel()
 	}()
 
-	// Start daemon services (FUSE mount + HTTP API) in background
-	if err := daemon.Start(ctx); err != nil {
+	// Start daemon services (FUSE mount) in background
+	if err := daemon.Start(ctx, cfg.Mountpoint, client); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
+	}
+
+	// Handle --mount flag (mount and keep alive without GUI)
+	if *mount {
+		log.Println("Filesystem mounted. Press Ctrl+C to unmount and exit.")
+		daemon.KeepAlive(ctx)
+		return
 	}
 
 	// Headless mode: no GUI, just run daemon
@@ -58,7 +88,6 @@ func main() {
 	}
 
 	// GUI mode: launch Wails window
-	client := api.NewClient(cfg.APIBase, cfg.ClientID, cfg.ClientSecret)
 	app := ui.NewApp(client)
 
 	err = wails.Run(&options.App{
