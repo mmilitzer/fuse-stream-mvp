@@ -55,7 +55,6 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 		"-o", "ro",                    // Read-only
 		"-o", "fsname=fusestream",     // Filesystem name
 		"-o", "volname=FuseStream",    // Volume name
-		"-o", "allow_other",           // Allow other users
 	}
 
 	// Mount the filesystem
