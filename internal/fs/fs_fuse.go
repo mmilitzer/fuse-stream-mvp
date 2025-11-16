@@ -4,7 +4,9 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -296,17 +298,19 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				// Initialize fetcher on first open
 				sf.fetcherMu.Lock()
 				if sf.fetcher == nil {
+					log.Printf("Open: Initializing fetcher for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
-						log.Printf("Failed to build temp URL: %v", err)
+						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
 						sf.Status = "error"
 						sf.fetcherMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
 					}
+					log.Printf("Open: Got temp URL for %s: %s", sf.FileName, tempURL)
 
 					f, err := fetcher.New(fs.ctx, tempURL, sf.Size)
 					if err != nil {
-						log.Printf("Failed to create fetcher: %v", err)
+						log.Printf("Failed to create fetcher for %s: %v", sf.FileName, err)
 						sf.Status = "error"
 						sf.fetcherMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
@@ -314,8 +318,10 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 
 					sf.fetcher = f
 					sf.Status = "open"
+					log.Printf("Open: Fetcher initialized successfully for %s", sf.FileName)
 				}
 				sf.openCount++
+				log.Printf("Open: %s opened (openCount=%d)", sf.FileName, sf.openCount)
 				sf.fetcherMu.Unlock()
 				
 				return 0, 0
@@ -341,25 +347,37 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 				sf.fetcherMu.Lock()
 				f := sf.fetcher
 				if f == nil {
+					log.Printf("Read: %s fetcher is nil at offset %d", sf.FileName, ofst)
 					sf.fetcherMu.Unlock()
 					return -fuse.EIO
 				}
 				sf.Status = "reading"
 				sf.fetcherMu.Unlock()
 
+				log.Printf("Read: %s reading %d bytes at offset %d", sf.FileName, len(buff), ofst)
 				n, err := f.ReadAt(fs.ctx, buff, ofst)
-				if err != nil && n == 0 {
-					if err.Error() == "EOF" {
+				
+				// Handle EOF correctly
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						log.Printf("Read: %s reached EOF at offset %d", sf.FileName, ofst)
 						sf.fetcherMu.Lock()
 						sf.Status = "done"
 						sf.fetcherMu.Unlock()
 						return 0
 					}
-					log.Printf("Read error at offset %d: %v", ofst, err)
-					sf.fetcherMu.Lock()
-					sf.Status = "error"
-					sf.fetcherMu.Unlock()
-					return -fuse.EIO
+					// For other errors, only fail if we read nothing
+					if n == 0 {
+						log.Printf("Read error for %s at offset %d: %v", sf.FileName, ofst, err)
+						sf.fetcherMu.Lock()
+						sf.Status = "error"
+						sf.fetcherMu.Unlock()
+						return -fuse.EIO
+					}
+					// If we got some data despite error, return the data
+					log.Printf("Partial read for %s at offset %d: read %d bytes with error: %v", sf.FileName, ofst, n, err)
+				} else {
+					log.Printf("Read: %s successfully read %d bytes at offset %d", sf.FileName, n, ofst)
 				}
 
 				return n
