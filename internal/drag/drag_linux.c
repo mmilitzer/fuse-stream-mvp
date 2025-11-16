@@ -37,20 +37,8 @@ static void on_drag_begin(GtkWidget *widget, GdkDragContext *context, gpointer u
     DragContext *ctx = (DragContext*)user_data;
     ctx->drag_started = TRUE;
     
-    // Set a generic document icon for the drag operation
-    GtkIconTheme *icon_theme = gtk_icon_theme_get_default();
-    GdkPixbuf *icon_pixbuf = gtk_icon_theme_load_icon(
-        icon_theme,
-        "text-x-generic",
-        48,
-        0,
-        NULL
-    );
-    
-    if (icon_pixbuf) {
-        gtk_drag_set_icon_pixbuf(context, icon_pixbuf, 24, 24);
-        g_object_unref(icon_pixbuf);
-    }
+    // Use default drag icon - no manual pixbuf management to avoid crashes
+    gtk_drag_set_icon_default(context);
 }
 
 // Callback to handle button press and initiate drag
@@ -172,10 +160,12 @@ int FSMVP_StartFileDrag(const char* path) {
     ctx.loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(ctx.loop);
     
-    // Cleanup
+    // Cleanup - only after drag-end callback has completed
     g_source_remove(timeout_id);
     g_main_loop_unref(ctx.loop);
     
+    // Destroy window (and all child widgets) after drag completes
+    // This ensures GTK has finished using all drag-related resources
     if (ctx.window) {
         gtk_widget_destroy(ctx.window);
     }
