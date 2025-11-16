@@ -6,6 +6,7 @@ package drag
 #cgo CFLAGS: -x objective-c -fmodules -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa
 
+#include <stdlib.h>
 void StartFileDrag(const char *cpath);
 */
 import "C"
