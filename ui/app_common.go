@@ -2,9 +2,11 @@ package ui
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/drag"
 )
 
 type App struct {
@@ -131,4 +133,19 @@ func (a *App) GetStagedFiles() []StagedFileInfo {
 	}
 	
 	return result
+}
+
+// StartNativeDrag initiates a native file drag operation (macOS only).
+// Only works when the filesystem is mounted and the file exists.
+func (a *App) StartNativeDrag(absPath string) error {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return fmt.Errorf("filesystem not available")
+	}
+
+	if !filesystem.Mounted() {
+		return fmt.Errorf("mount disabled in this build")
+	}
+
+	return drag.StartFileDrag(absPath)
 }
