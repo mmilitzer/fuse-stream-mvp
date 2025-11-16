@@ -13,6 +13,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Install FUSE and GTK3 dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse-dev libgtk-3-dev
       - name: Build frontend
         run: |
           cd frontend
@@ -21,7 +25,7 @@ jobs:
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
-        run: go test ./... -run Test -v
+        run: go test ./... -run Test -v -tags fuse
 
   build-linux:
     runs-on: ubuntu-22.04
@@ -39,12 +43,13 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.0-dev \
             libnss3-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            libfuse-dev
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build Wails GUI app
         run: |
-          wails build -skipbindings -platform linux/amd64
+          wails build -skipbindings -platform linux/amd64 -tags fuse
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin
@@ -72,7 +77,7 @@ jobs:
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin
-          CGO_ENABLED=1 go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
+          go build -o build/bin/fuse-stream-mvp-headless .
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
