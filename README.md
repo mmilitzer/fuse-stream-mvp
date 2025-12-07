@@ -127,12 +127,23 @@ For most users, the default `temp-file` mode is recommended.
 
 ### Prerequisites
 
-- **macOS 15.4+** (Sequoia or later)
-- **macFUSE with FSKit backend**: Install from [macfuse.io](https://macfuse.io/)
-  - No Recovery Mode changes required on macOS 15.4+ (FSKit uses user-space extensions)
-  - After installation, macFUSE will be available at `/Library/Filesystems/macfuse.fs`
+**Critical Requirements:**
+- **macOS ≥15.4** (Sequoia or later) - Required for FSKit support
+- **macFUSE ≥5** with FSKit backend - Install from [macfuse.io](https://macfuse.io/)
+  - FSKit backend eliminates kernel extension (kext) requirement
+  - No Recovery Mode changes needed
+  - Verified with: `/Library/Filesystems/macfuse.fs` should exist after installation
+  - App uses `-o backend=fskit` mount option
+
+**Build Tools:**
 - **Go 1.22+**
 - **Wails CLI**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+
+**Why FSKit?**
+- macOS 15.4+ uses FSKit (File System Kit) - a user-space file system framework
+- No kernel extensions = no System Integrity Protection (SIP) warnings
+- More stable and secure than legacy kext approach
+- See: [macFUSE FSKit backend documentation](https://github.com/macfuse/macfuse/wiki/Getting-Started)
 
 ### Build
 
@@ -178,11 +189,9 @@ This launches the app with hot-reload for frontend changes and proper build tags
 
 ```bash
 # Build first
-wails build -skipbindings
+wails build -skipbindings -tags fuse
 
 # Then run
-./build/bin/fuse-stream-mvp              # Linux
-# or
 open ./build/bin/fuse-stream-mvp.app     # macOS
 ```
 
@@ -198,10 +207,31 @@ go build -tags fuse -o fuse-stream-mvp-headless .
 
 This starts the daemon (FUSE mount + HTTP server) without launching a window. Useful for CI or manual testing.
 
-The GUI app mounts (e.g., `/Volumes/FuseStream`) and opens a window:
+The GUI app mounts at `/Volumes/FuseStream` and opens a window:
 - List jobs → pick output (if multiple) → enter recipient id → **Stage for upload**
 - A file appears in `Staged/` and a big draggable tile is shown.
 - Drag the tile into the target site's upload zone; upload continues in background.
+
+### Troubleshooting
+
+**Mount fails with "unknown option" or "backend not found":**
+- Verify macFUSE ≥5 is installed: `ls /Library/Filesystems/macfuse.fs`
+- Check macOS version: `sw_vers` (should show ≥15.4)
+- Reinstall macFUSE from [macfuse.io](https://macfuse.io/)
+
+**"Operation not permitted" or permission errors:**
+- Ensure System Settings → Privacy & Security allows macFUSE
+- Check that mountpoint directory is writable
+
+**App crashes during drag:**
+- Check Console.app for crash logs
+- Verify file is visible in Finder at `/Volumes/FuseStream/Staged/`
+- Try restarting the app (mount recovery will handle stale mounts)
+
+**Sleep prevention not working:**
+- Check logs for `[sleep] Sleep prevention enabled`
+- Verify IOKit framework is available
+- macOS may override sleep prevention for low battery or scheduled sleep
 
 ### Testing
 
@@ -250,22 +280,26 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 ### M3 — macOS-only MVP (Current)
 **M3 is macOS-only** with production-ready features:
-- ✅ **macOS FSKit** with self-hosted CI build (`[self-hosted, macOS, ARM64, macFUSE]`)
+- ✅ **macOS FSKit backend**: Uses `-o backend=fskit` for user-space FUSE (no kext)
+- ✅ **Self-hosted CI build**: Single macOS job on `[self-hosted, macOS, ARM64, macFUSE]` runner
 - ✅ **Robust Cocoa drag-and-drop**: Idempotent with re-entrancy guards, validation, and proper NSPasteboardTypeFileURL usage
 - ✅ **Mount recovery**: Automatic detection and cleanup of stale mounts using `diskutil unmount force`
 - ✅ **Sleep prevention**: IOPMAssertionCreateWithName integration (active during file handles open)
 - ✅ **Dual-ref eviction**: tileRef + openRef system prevents premature cache eviction
 - ✅ **Multi-open support**: BackingStore ref counting handles concurrent/repeated file opens
+- ✅ **Error guidance**: Clear error messages if mount fails (FSKit/macFUSE version requirements)
 - ❌ **Linux GTK drag removed**: Linux builds show error message (M3 is macOS-only)
 
 **Acceptance criteria:**
-- [ ] CI `macos-fskit-build` job passes on self-hosted runner
-- [ ] App mounts successfully on macOS 15.4+ with macFUSE
-- [ ] Cocoa drag works reliably (no crashes, no stale pointers)
+- [ ] CI `macos-fskit-build` job passes on self-hosted runner (single macOS job)
+- [ ] App mounts successfully using FSKit backend (verify with `-o backend=fskit`)
+- [ ] No kernel extension prompts or Recovery Mode requirements
+- [ ] Cocoa drag works reliably (Safari/Chrome, no crashes, no stale pointers)
 - [ ] Mount recovery handles stale mounts from force-quit/crash
-- [ ] Sleep prevention activates during uploads
+- [ ] Sleep prevention activates during uploads (check logs)
 - [ ] Staging a new file doesn't break in-progress upload
 - [ ] Multiple drag attempts on same tile work correctly
+- [ ] Mount failure shows actionable error message with macFUSE/FSKit guidance
 
 ---
 

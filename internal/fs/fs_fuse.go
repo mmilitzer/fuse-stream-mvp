@@ -98,10 +98,12 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 
 	switch runtime.GOOS {
 	case "darwin":
-		// macFUSE/macOS-specific options
+		// macFUSE/macOS-specific options with FSKit backend
+		// FSKit backend requires macFUSE ≥5 on macOS ≥15.4 (no kernel extension)
 		mountOpts = append(mountOpts,
 			"-o", "local",
 			"-o", "volname=FuseStream",
+			"-o", "backend=fskit",  // Required for FSKit backend
 		)
 	case "linux":
 		// Linux: NO volname (not supported), and NO allow_other by default
@@ -110,15 +112,36 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 	}
 
 	// Mount the filesystem
+	mountResult := make(chan bool, 1)
 	go func() {
-		if !fs.host.Mount(fs.mountpoint, mountOpts) {
-			log.Printf("Failed to mount filesystem at %s", fs.mountpoint)
+		success := fs.host.Mount(fs.mountpoint, mountOpts)
+		mountResult <- success
+		if !success {
+			log.Printf("[fs] Failed to mount filesystem at %s", fs.mountpoint)
+			if runtime.GOOS == "darwin" {
+				log.Printf("[fs] ERROR: Mount failed. This may indicate:")
+				log.Printf("[fs]   - macFUSE is not installed or is too old (requires macFUSE ≥5)")
+				log.Printf("[fs]   - macOS version is too old (requires macOS ≥15.4 for FSKit)")
+				log.Printf("[fs]   - FSKit backend is not available (try 'backend=fskit' option)")
+				log.Printf("[fs]   - Mountpoint is already in use or inaccessible")
+				log.Printf("[fs] Install macFUSE with FSKit support from: https://macfuse.io/")
+			}
 		}
 	}()
 
-	// Wait a bit for mount to complete
+	// Wait for mount to complete (with timeout)
+	select {
+	case success := <-mountResult:
+		if !success {
+			return fmt.Errorf("mount failed at %s (see logs for details)", fs.mountpoint)
+		}
+		fs.mounted = true
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("mount timed out at %s", fs.mountpoint)
+	}
+	
+	// Additional wait for filesystem to be fully ready
 	time.Sleep(100 * time.Millisecond)
-	fs.mounted = true
 	
 	return nil
 }

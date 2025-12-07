@@ -60,30 +60,6 @@ jobs:
           name: linux-build
           path: build/bin/**
 
-  build-macos:
-    runs-on: macos-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-      - name: Install Wails
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
-      - name: Build Wails GUI app
-        run: |
-          wails build -skipbindings -platform darwin/universal
-      - name: Build headless binary (for dev/testing)
-        run: |
-          mkdir -p build/bin
-          go build -o build/bin/fuse-stream-mvp-headless .
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-build
-          path: build/bin/**
-
   macos-fskit-build:
     runs-on: [self-hosted, macOS, ARM64, macFUSE]
     timeout-minutes: 25
@@ -96,24 +72,25 @@ jobs:
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      - name: Build Wails GUI app (macOS, FUSE)
+      - name: Build Wails GUI app (macOS, FSKit/FUSE)
         run: |
           wails build -skipbindings -tags fuse
 
-      - name: Build headless binary (macOS, FUSE)
+      - name: Build headless binary (macOS, FSKit/FUSE)
         run: |
           mkdir -p dist
           go build -tags fuse -o dist/fuse-stream-macos .
 
       - name: Package artifacts
         run: |
-          cp -R build/bin/*.app dist/ || true
-          cd dist && zip -r macos-fskit-build.zip * && cd ..
+          mkdir -p dist
+          cp -R build/bin/*.app dist/ 2>/dev/null || true
+          cd dist && zip -r macos-build.zip * && cd ..
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-fskit
-          path: dist/macos-fskit-build.zip
+          path: dist/macos-build.zip
 
   live-contract-tests:
     if: >
