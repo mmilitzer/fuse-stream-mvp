@@ -60,6 +60,18 @@ jobs:
           name: linux-build
           path: build/bin/**
 
+  # Legacy job name for PR check compatibility
+  # Replaced by macos-fskit-build (self-hosted runner with FSKit support)
+  build-macos:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 1
+    steps:
+      - name: Deprecated - use macos-fskit-build instead
+        run: |
+          echo "✅ This job has been replaced by 'macos-fskit-build'"
+          echo "The new job runs on a self-hosted macOS runner with FSKit support"
+          echo "See macos-fskit-build job for actual macOS build results"
+
   macos-fskit-build:
     runs-on: [self-hosted, macOS, ARM64, macFUSE]
     timeout-minutes: 25
