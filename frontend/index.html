@@ -87,6 +87,19 @@
             margin: 20px auto;
             cursor: move;
             box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            position: relative;
+        }
+        .drag-tile.disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .drag-tile[title]:after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
         }
         .info {
             color: #666;
@@ -144,6 +157,7 @@
     <script>
         let selectedJob = null;
         let selectedOutput = null;
+        let stagedFilePath = null;
 
         function showScreen(screenId) {
             document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -235,20 +249,66 @@
             window.go.ui.App.StageForUpload({
                 fileId: selectedOutput.fileId,
                 fileName: selectedOutput.fileName,
-                recipientTag: recipientTag
+                recipientTag: recipientTag,
+                size: selectedOutput.size,
+                contentType: selectedOutput.contentType
             })
             .then(resp => {
                 if (resp.success) {
-                    document.getElementById('drag-tile').style.display = 'flex';
+                    stagedFilePath = resp.filePath;
+                    const dragTile = document.getElementById('drag-tile');
+                    dragTile.style.display = 'flex';
+                    dragTile.classList.remove('disabled');
+                    dragTile.removeAttribute('title');
                     document.getElementById('staged-path').textContent = 
                         `File path: ${resp.filePath}\n${resp.message}`;
                     document.getElementById('staged-path').style.display = 'block';
+                    setupDragTile();
                 } else {
                     showError(resp.message || 'Failed to stage file.');
+                    // Show disabled tile if mount not available
+                    if (resp.message && resp.message.includes('not available')) {
+                        const dragTile = document.getElementById('drag-tile');
+                        dragTile.style.display = 'flex';
+                        dragTile.classList.add('disabled');
+                        dragTile.setAttribute('title', 'Mount disabled in this build');
+                        dragTile.removeAttribute('draggable');
+                    }
                 }
             })
             .catch(err => {
                 showError('Error staging file: ' + err);
+            });
+        }
+
+        function setupDragTile() {
+            const dragTile = document.getElementById('drag-tile');
+            
+            // mousedown handler to initiate native drag on macOS
+            dragTile.addEventListener('mousedown', function(e) {
+                if (!stagedFilePath) return;
+                
+                // Try to start native drag
+                window.go.ui.App.StartNativeDrag(stagedFilePath)
+                    .then(() => {
+                        // Native drag started successfully
+                        e.preventDefault();
+                    })
+                    .catch(err => {
+                        // Native drag not supported, fall back to HTML5 drag
+                        console.log('Native drag not available:', err);
+                    });
+            });
+
+            // HTML5 dragstart fallback for non-macOS platforms
+            dragTile.addEventListener('dragstart', function(e) {
+                if (!stagedFilePath) {
+                    e.preventDefault();
+                    return;
+                }
+                // For non-macOS, use standard HTML5 drag
+                e.dataTransfer.effectAllowed = 'copy';
+                e.dataTransfer.setData('text/plain', stagedFilePath);
             });
         }
 

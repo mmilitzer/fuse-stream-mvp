@@ -61,7 +61,7 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 /main.go                   # entrypoint: starts mount + launches UI
 /frontend/                 # static HTML frontend (embedded at build time)
 /internal/api/             # MediaHub API client (OAuth, jobs, downloads)
-/internal/fetcher/         # HTTP Range fetcher with bounded readahead + LRU seek cache
+/internal/fetcher/         # HTTP Range fetcher (temp-file default, range-lru experimental)
 /internal/fs/              # FUSE RO FS (cgofuse) exposing /Staged
 /internal/daemon/          # daemon lifecycle management
 /ui/                       # Wails app (frontend + bindings)
@@ -81,6 +81,11 @@ client_secret = "YOUR_CLIENT_SECRET"
 
 # Optional runtime overrides:
 mountpoint = "/Volumes/FuseStream"   # macOS default; e.g. "/mnt/fusestream" on Linux
+
+# Fetch mode (optional):
+fetch_mode = "temp-file"   # default: downloads entire file to temp dir (reliable, recommended)
+                           # experimental: "range-lru" (streams chunks on-demand, memory-based cache)
+temp_dir = "/tmp"          # temp file directory (only used in temp-file mode)
 ```
 
 Environment variable overrides (take precedence):
@@ -88,8 +93,26 @@ Environment variable overrides (take precedence):
 - `FSMVP_CLIENT_ID`
 - `FSMVP_CLIENT_SECRET`
 - `FSMVP_MOUNTPOINT`
+- `FSMVP_FETCH_MODE` (`temp-file` or `range-lru`)
+- `FSMVP_TEMP_DIR`
 
 > The short‑lived **OAuth token is cached in memory only**.
+
+### Fetch Modes
+
+**`temp-file` (default, recommended)**:
+- Downloads the entire file to a temporary file on first open
+- Subsequent reads are served from disk (fast, reliable)
+- Temp file persists until both UI staging and FUSE handles are closed (see BackingStore Lifecycle)
+- Best for: MVP use case, repeated uploads, stable performance
+
+**`range-lru` (experimental)**:
+- Streams 4MB chunks on-demand via HTTP Range requests
+- LRU cache keeps 8 chunks (~32MB) in memory
+- No disk usage, but may be slower for non-sequential access
+- Best for: memory-constrained environments, testing
+
+For most users, the default `temp-file` mode is recommended.
 
 ---
 
@@ -196,7 +219,9 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 ### M2 — FUSE mount + staging
 - Implement read-only FUSE FS (cgofuse) exposing `Staged/` and mapping staged items to fixed-size files.
-- HTTP Range fetcher with bounded readahead, LRU seek cache, and retries; supports non-linear reads.
+- HTTP Range fetcher with two modes:
+  - **temp-file** (default): downloads entire file to temp dir on first open (reliable, recommended)
+  - **range-lru** (experimental): streams 4MB chunks on-demand with LRU cache
 - Wire UI: “Stage for upload” adds/removes items; show progress (bytes served vs. total).
 - **Acceptance:** dragging the staged file into a browser upload zone starts an upload; overlapping transfer observed on a large test file.
 
@@ -212,6 +237,79 @@ In CI, live tests run automatically on push and pull requests, using repository 
 
 - **Never commit credentials.** Use **GitHub Actions secrets** (`MEDIAHUB_CLIENT_ID`, `MEDIAHUB_CLIENT_SECRET`) for CI unit tests that don’t hit live endpoints.
 - For local dev, put the client credentials only in `config.toml` or env vars. The short‑lived token stays in memory.
+
+---
+
+## BackingStore Lifecycle
+
+The BackingStore (cache) lifecycle uses a **two-reference counting system** to handle concurrent uploads and staging:
+
+### Two-Ref System
+
+Each staged file tracks two independent reference counts:
+
+1. **tileRef** (UI reference):
+   - `1` when the tile is visible/staged in the UI
+   - `0` when the tile is replaced or hidden
+   - Set by `StageFile()` and `EvictStagedFile()`
+
+2. **openRef** (FUSE handle count):
+   - Incremented on each FUSE `Open()` (browser opens the file)
+   - Decremented on each FUSE `Release()` (browser closes the file)
+   - Tracks active file handles from the OS/browser
+
+### Eviction Rule
+
+**BackingStore is closed and temp file deleted ONLY when BOTH refs are 0.**
+
+This prevents the critical bug where staging a new file would delete the temp file of an in-progress upload.
+
+### Behavior
+
+- **Staging a new file**:
+  - Sets `tileRef=0` for previous staged file
+  - Does **NOT** close if `openRef > 0` (upload in progress)
+  - Creates new file with `tileRef=1, openRef=0`
+
+- **FUSE Open/Release**:
+  - `Open()`: `openRef++` (and BackingStore.IncRef())
+  - `Release()`: `openRef--` (and BackingStore.DecRef())
+  - On `Release()` with `openRef==0 && tileRef==0`: evict
+
+- **Explicit eviction** (user action or app shutdown):
+  - Sets `tileRef=0`
+  - Evicts only if `openRef==0`
+  - Waits for active uploads to complete
+
+### Example Timeline
+
+1. **Stage file A**: `tileRef=1, openRef=0`
+2. **Browser opens A**: `tileRef=1, openRef=1` (upload starts)
+3. **User stages file B**: A gets `tileRef=0, openRef=1` (still uploading → NOT evicted)
+4. **Browser closes A**: A gets `tileRef=0, openRef=0` → **evicted now**
+5. **File B remains**: `tileRef=1, openRef=0` (ready for next upload)
+
+### Benefits
+
+- **Repeated uploads**: Dragging the same staged tile multiple times reuses the existing cache (no re-download in temp-file mode).
+- **Multi-handle support**: Browser can open/close the file multiple times during upload without cache loss.
+- **Single-tile MVP**: For this milestone, staging a new file automatically evicts the old one (max 1 temp file on disk).
+
+### Future Extensions
+
+- Multiple concurrent staged items (needs LRU eviction policy for temp files)
+- User-triggered eviction from UI ("Clear Cache" button)
+- Time-based eviction (evict after N minutes idle)
+
+### Testing
+
+See `internal/fetcher/store_lifecycle_test.go` for comprehensive tests covering:
+- Store survival across refCount going to 0
+- Reuse of same store on repeated open/read cycles
+- Explicit eviction behavior
+- Concurrent multi-handle access
+- Temp file lifecycle (TempFile mode)
+- Cache behavior (RangeLRU mode)
 
 ---
 
