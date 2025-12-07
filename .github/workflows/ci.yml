@@ -84,6 +84,37 @@ jobs:
           name: macos-build
           path: build/bin/**
 
+  macos-fskit-build:
+    runs-on: [self-hosted, macOS, ARM64, macFUSE]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build Wails GUI app (macOS, FUSE)
+        run: |
+          wails build -skipbindings -tags fuse
+
+      - name: Build headless binary (macOS, FUSE)
+        run: |
+          mkdir -p dist
+          go build -tags fuse -o dist/fuse-stream-macos .
+
+      - name: Package artifacts
+        run: |
+          cp -R build/bin/*.app dist/ || true
+          cd dist && zip -r macos-fskit-build.zip * && cd ..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-fskit
+          path: dist/macos-fskit-build.zip
+
   live-contract-tests:
     if: >
       (github.event_name == 'pull_request' &&

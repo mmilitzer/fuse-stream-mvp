@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/sleep"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/winfsp/cgofuse/fuse"
 )
@@ -54,6 +56,10 @@ type fuseFS struct {
 	fhToPath      map[uint64]string
 	fhToStagedID  map[uint64]string  // Maps file handle to staged file ID
 	fhMu          sync.RWMutex
+	
+	// Sleep prevention
+	sleepRelease  func()
+	sleepMu       sync.Mutex
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
@@ -73,6 +79,15 @@ func newFS(client *api.Client, cfg *config.Config) FS {
 
 func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
+	
+	// Attempt mount recovery on macOS
+	if runtime.GOOS == "darwin" {
+		if err := fs.recoverStaleMountMacOS(); err != nil {
+			log.Printf("[fs] Warning: mount recovery failed: %v", err)
+			// Continue anyway - the mount attempt below will fail if there's still an issue
+		}
+	}
+	
 	fs.host = fuse.NewFileSystemHost(fs)
 	
 	// Mount options (OS-specific)
@@ -108,11 +123,73 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 	return nil
 }
 
+// recoverStaleMountMacOS attempts to unmount any stale mount at the mountpoint
+// before we try to mount. This handles the case where the app crashed or was
+// force-quit without properly unmounting.
+func (fs *fuseFS) recoverStaleMountMacOS() error {
+	// Check if mountpoint is already mounted by checking if it's accessible
+	// and has a .fuse_hidden file (or similar FUSE marker)
+	_, err := os.Stat(fs.mountpoint)
+	if err != nil {
+		// Mountpoint doesn't exist or isn't accessible, nothing to recover
+		if os.IsNotExist(err) {
+			log.Printf("[fs] Mount recovery: mountpoint doesn't exist, creating it")
+			return os.MkdirAll(fs.mountpoint, 0755)
+		}
+		return nil
+	}
+	
+	// Try to detect if it's a stale mount by attempting to list directory
+	// A stale FUSE mount will typically hang or error
+	doneCh := make(chan error, 1)
+	go func() {
+		_, err := os.ReadDir(fs.mountpoint)
+		doneCh <- err
+	}()
+	
+	select {
+	case err := <-doneCh:
+		// If we can read the directory, it might be a valid mount or just a regular directory
+		// In either case, try to unmount it
+		if err == nil {
+			log.Printf("[fs] Mount recovery: detected possible stale mount at %s, attempting force unmount", fs.mountpoint)
+		} else {
+			log.Printf("[fs] Mount recovery: error accessing mountpoint %s: %v, attempting force unmount", fs.mountpoint, err)
+		}
+	case <-time.After(2 * time.Second):
+		// Timeout - likely a stale mount that's hanging
+		log.Printf("[fs] Mount recovery: timeout accessing mountpoint %s, attempting force unmount", fs.mountpoint)
+	}
+	
+	// Try diskutil unmount force (preferred on macOS)
+	log.Printf("[fs] Attempting: diskutil unmount force %s", fs.mountpoint)
+	cmd := fmt.Sprintf("diskutil unmount force '%s' 2>&1 || umount -f '%s' 2>&1 || true", fs.mountpoint, fs.mountpoint)
+	output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		log.Printf("[fs] Mount recovery command failed (may be expected): %v, output: %s", err, string(output))
+	} else {
+		log.Printf("[fs] Mount recovery successful or no mount present: %s", string(output))
+	}
+	
+	// Give the system a moment to finish unmounting
+	time.Sleep(200 * time.Millisecond)
+	
+	return nil
+}
+
 func (fs *fuseFS) Stop() error {
 	// Evict all staged files to clean up BackingStores
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("Stop: Error evicting staged files: %v", err)
 	}
+	
+	// Release sleep prevention if active
+	fs.sleepMu.Lock()
+	if fs.sleepRelease != nil {
+		fs.sleepRelease()
+		fs.sleepRelease = nil
+	}
+	fs.sleepMu.Unlock()
 	
 	fs.cancel()
 	if fs.host != nil {
@@ -463,7 +540,13 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				fs.fhToStore[fh] = sf.store
 				fs.fhToPath[fh] = path
 				fs.fhToStagedID[fh] = stagedID  // Store staged file ID for Release
+				isFirstHandle := len(fs.fhToStore) == 1
 				fs.fhMu.Unlock()
+				
+				// Enable sleep prevention on first file handle
+				if isFirstHandle {
+					fs.enableSleepPrevention()
+				}
 				
 				tileRef := atomic.LoadInt32(&sf.tileRef)
 				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
@@ -558,6 +641,9 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 		log.Printf("Release: %s closed (fh=%d, storeRefCount=%d) - staged file no longer exists", 
 			fileName, fh, newStoreRefCount)
 	}
+	
+	// Disable sleep prevention if this was the last file handle
+	fs.disableSleepPrevention()
 
 	return 0
 }
@@ -662,4 +748,44 @@ func (fs *fuseFS) Listxattr(path string, fill func(name string) bool) int {
 
 func (fs *fuseFS) Mknod(path string, mode uint32, dev uint64) int {
 	return -fuse.EROFS
+}
+
+// enableSleepPrevention enables sleep prevention when the first file handle is opened.
+func (fs *fuseFS) enableSleepPrevention() {
+	fs.sleepMu.Lock()
+	defer fs.sleepMu.Unlock()
+	
+	// Only enable if not already enabled
+	if fs.sleepRelease != nil {
+		return
+	}
+	
+	release, err := sleep.PreventSleep()
+	if err != nil {
+		log.Printf("[fs] Warning: failed to enable sleep prevention: %v", err)
+		return
+	}
+	
+	fs.sleepRelease = release
+}
+
+// disableSleepPrevention disables sleep prevention when all file handles are closed.
+func (fs *fuseFS) disableSleepPrevention() {
+	fs.sleepMu.Lock()
+	defer fs.sleepMu.Unlock()
+	
+	if fs.sleepRelease == nil {
+		return
+	}
+	
+	// Check if there are any open file handles
+	fs.fhMu.RLock()
+	hasOpenHandles := len(fs.fhToStore) > 0
+	fs.fhMu.RUnlock()
+	
+	// Only disable if no file handles are open
+	if !hasOpenHandles {
+		fs.sleepRelease()
+		fs.sleepRelease = nil
+	}
 }

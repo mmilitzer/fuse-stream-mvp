@@ -2,10 +2,17 @@
 
 Drag-to-upload for large videos without pre-downloading: a read-only virtual filesystem that streams from **Xvid MediaHub** over HTTP Range while the browser uploads.
 
-This MVP targets:
-- **macOS 15.4+** with **macFUSE FSKit backend** (no kext).
-- **Linux** with FUSE3.
-- (Windows is out-of-scope for Milestones M1–M3.)
+## Current Status: M3 (macOS-only MVP)
+
+**M3 is macOS-only** with production-ready features:
+- **macOS 15.4+** with **macFUSE FSKit backend** (no kext)
+- Robust Cocoa drag-and-drop (idempotent, validated)
+- Automatic mount recovery (stale mount detection and cleanup)
+- Sleep prevention during active transfers (IOPMAssertion)
+- Dual-ref eviction system (tileRef + openRef)
+- Self-hosted macOS CI build
+
+Linux support (M1/M2) has been removed in this milestone. Future cross-platform support may be reconsidered post-M3.
 
 ---
 
@@ -116,10 +123,16 @@ For most users, the default `temp-file` mode is recommended.
 
 ---
 
-## Development
+## Development (macOS)
 
-- **macOS**: install **macFUSE** (FSKit backend). No Recovery Mode changes required on 15.4+.
-- **Linux**: ensure **fuse3** and user has FUSE permission.
+### Prerequisites
+
+- **macOS 15.4+** (Sequoia or later)
+- **macFUSE with FSKit backend**: Install from [macfuse.io](https://macfuse.io/)
+  - No Recovery Mode changes required on macOS 15.4+ (FSKit uses user-space extensions)
+  - After installation, macFUSE will be available at `/Library/Filesystems/macfuse.fs`
+- **Go 1.22+**
+- **Wails CLI**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
 
 ### Build
 
@@ -132,11 +145,21 @@ go install github.com/wailsapp/wails/v2/cmd/wails@latest
 # Production build (GUI app)
 wails build -skipbindings
 
-# Binaries will be in build/bin/
-# - Linux: build/bin/fuse-stream-mvp
-# - macOS: build/bin/fuse-stream-mvp.app
+# Binary will be in build/bin/fuse-stream-mvp.app
 
 # Headless build (for dev/testing, no GUI)
+go build -tags fuse -o fuse-stream-mvp-headless .
+```
+
+### macOS-specific builds
+
+For FSKit-enabled builds (recommended on M3):
+
+```bash
+# Build with FUSE support tag
+wails build -skipbindings -tags fuse
+
+# Or for headless:
 go build -tags fuse -o fuse-stream-mvp-headless .
 ```
 
@@ -225,11 +248,24 @@ In CI, live tests run automatically on push and pull requests, using repository 
 - Wire UI: “Stage for upload” adds/removes items; show progress (bytes served vs. total).
 - **Acceptance:** dragging the staged file into a browser upload zone starts an upload; overlapping transfer observed on a large test file.
 
-### M3 — Polish
-- Sleep prevention while file handles are open.
-- Error surfaces (expired URL → refresh once; 5xx → retry with backoff).
-- Cache eviction after reader closes; concurrent staging.
-- Optional: HMAC download URL flow as alternative to Bearer.
+### M3 — macOS-only MVP (Current)
+**M3 is macOS-only** with production-ready features:
+- ✅ **macOS FSKit** with self-hosted CI build (`[self-hosted, macOS, ARM64, macFUSE]`)
+- ✅ **Robust Cocoa drag-and-drop**: Idempotent with re-entrancy guards, validation, and proper NSPasteboardTypeFileURL usage
+- ✅ **Mount recovery**: Automatic detection and cleanup of stale mounts using `diskutil unmount force`
+- ✅ **Sleep prevention**: IOPMAssertionCreateWithName integration (active during file handles open)
+- ✅ **Dual-ref eviction**: tileRef + openRef system prevents premature cache eviction
+- ✅ **Multi-open support**: BackingStore ref counting handles concurrent/repeated file opens
+- ❌ **Linux GTK drag removed**: Linux builds show error message (M3 is macOS-only)
+
+**Acceptance criteria:**
+- [ ] CI `macos-fskit-build` job passes on self-hosted runner
+- [ ] App mounts successfully on macOS 15.4+ with macFUSE
+- [ ] Cocoa drag works reliably (no crashes, no stale pointers)
+- [ ] Mount recovery handles stale mounts from force-quit/crash
+- [ ] Sleep prevention activates during uploads
+- [ ] Staging a new file doesn't break in-progress upload
+- [ ] Multiple drag attempts on same tile work correctly
 
 ---
 
