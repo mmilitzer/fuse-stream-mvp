@@ -189,7 +189,7 @@
             <button id="btn-back-to-outputs">← Back to Outputs</button>
             
             <!-- Drag tile (shown after staging) -->
-            <div id="drag-tile" class="drag-tile" style="display:none;" draggable="true">
+            <div id="drag-tile" class="drag-tile" style="display:none;" draggable="false">
                 Drag to Upload
             </div>
             <div id="staged-path" class="info" style="display:none;"></div>
@@ -451,30 +451,20 @@
             const dragTile = document.getElementById('drag-tile');
             
             // mousedown handler to initiate native drag on macOS
+            // CRITICAL: Must call backend immediately, synchronously from mousedown
+            // so that Cocoa can access the current NSEvent on the main thread
             dragTile.addEventListener('mousedown', function(e) {
+                e.preventDefault(); // Stop HTML5 DnD immediately
+                
                 if (!stagedFilePath) return;
                 
-                // Try to start native drag
+                // Call Go backend immediately - do NOT await any async UI work
+                // Cocoa needs the current mouse event to start the drag
                 window.go.ui.App.StartNativeDrag(stagedFilePath)
-                    .then(() => {
-                        // Native drag started successfully
-                        e.preventDefault();
-                    })
                     .catch(err => {
-                        // Native drag not supported, fall back to HTML5 drag
-                        console.log('Native drag not available:', err);
+                        // Log errors but don't block - drag might still work
+                        console.error('Native drag error:', err);
                     });
-            });
-
-            // HTML5 dragstart fallback for non-macOS platforms
-            dragTile.addEventListener('dragstart', function(e) {
-                if (!stagedFilePath) {
-                    e.preventDefault();
-                    return;
-                }
-                // For non-macOS, use standard HTML5 drag
-                e.dataTransfer.effectAllowed = 'copy';
-                e.dataTransfer.setData('text/plain', stagedFilePath);
             });
         }
 
