@@ -47,14 +47,14 @@ jobs:
             libfuse-dev
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
-      - name: Build Wails GUI app
+      - name: Build GUI with Wails
         run: |
-          # Note: -tags fuse is automatic via wails.json "build:tags": "fuse"
-          wails build -skipbindings -platform linux/amd64
-      - name: Build headless binary (for dev/testing)
+          # wails.json has build:tags="fuse,gui" and build:dir="cmd/gui"
+          wails build -tags "production" -skipbindings -platform linux/amd64
+      - name: Build headless CLI
         run: |
           mkdir -p build/bin
-          go build -tags fuse -o build/bin/fuse-stream-mvp-headless .
+          go build -tags fuse -o build/bin/fuse-stream-cli ./cmd/cli
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -85,15 +85,15 @@ jobs:
       - name: Install Wails
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      - name: Build Wails GUI app (macOS, FSKit/FUSE)
+      - name: Build GUI (.app) with Wails
         run: |
-          # Note: -tags fuse is automatic via wails.json "build:tags": "fuse"
-          wails build -skipbindings
+          # wails.json has build:tags="fuse,gui" and build:dir="cmd/gui"
+          wails build -tags "production" -skipbindings
 
-      - name: Build headless binary (macOS, FSKit/FUSE)
+      - name: Build headless CLI
         run: |
           mkdir -p dist
-          go build -tags fuse -o dist/fuse-stream-macos .
+          go build -tags fuse -o dist/fuse-stream-cli ./cmd/cli
 
       - name: Package artifacts
         run: |

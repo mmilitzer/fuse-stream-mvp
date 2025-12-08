@@ -1,8 +1,9 @@
+//go:build gui
+
 package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -19,34 +20,10 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/ui"
 )
 
-var (
-	headless = flag.Bool("headless", false, "Run in headless mode (no GUI, daemon only)")
-	mount    = flag.Bool("mount", false, "Mount the filesystem and exit")
-	unmount  = flag.Bool("unmount", false, "Unmount the filesystem and exit")
-)
-
 func main() {
-	flag.Parse()
-
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	// Handle --unmount flag
-	if *unmount {
-		log.Printf("Unmounting filesystem at %s...", cfg.Mountpoint)
-		// Try to unmount using fusermount (Linux) or umount (macOS)
-		cmd := "fusermount"
-		args := []string{"-u", cfg.Mountpoint}
-		if err := syscall.Exec("/usr/bin/"+cmd, append([]string{cmd}, args...), os.Environ()); err != nil {
-			// Try umount on macOS
-			cmd = "umount"
-			if err := syscall.Exec("/sbin/"+cmd, append([]string{cmd}, cfg.Mountpoint), os.Environ()); err != nil {
-				log.Fatalf("Failed to unmount: %v", err)
-			}
-		}
-		return
 	}
 
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
@@ -74,20 +51,7 @@ func main() {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
 
-	// Handle --mount flag (mount and keep alive without GUI)
-	if *mount {
-		log.Println("Filesystem mounted. Press Ctrl+C to unmount and exit.")
-		daemon.KeepAlive(ctx)
-		return
-	}
-
-	// Headless mode: no GUI, just run daemon
-	if *headless {
-		daemon.KeepAlive(ctx)
-		return
-	}
-
-	// GUI mode: launch Wails window
+	// Launch Wails GUI
 	app := ui.NewApp(client)
 
 	err = wails.Run(&options.App{

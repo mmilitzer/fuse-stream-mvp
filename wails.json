@@ -20,5 +20,6 @@
     "comments": "M1: Scaffold API + UI"
   },
   "nsisType": "multiple",
-  "build:tags": "fuse"
+  "build:dir": "cmd/gui",
+  "build:tags": "fuse,gui"
 }

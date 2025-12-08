@@ -154,33 +154,31 @@ For most users, the default `temp-file` mode is recommended.
 
 ### Build
 
-**Important:** Wails applications **must** be built using the `wails` CLI (not `go build`) to include the required build tags.
+**Important:** GUI and CLI builds use separate entry points with build tags:
+- **GUI app**: `cmd/gui/main.go` (built with Wails, has `//go:build gui` tag)
+- **CLI app**: `cmd/cli/main.go` (built with `go build`, has `//go:build !gui` tag)
 
 ```bash
 # Install Wails CLI
 go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-# Production build (GUI app)
-# Note: wails.json is configured with "build:tags": "fuse", so -tags fuse is automatic
-wails build -skipbindings
+# Build GUI app (.app bundle)
+# wails.json has build:dir="cmd/gui" and build:tags="fuse,gui"
+wails build -tags "production" -skipbindings
 
 # Binary will be in build/bin/fuse-stream-mvp.app
 
-# Headless build (for dev/testing, no GUI)
-go build -tags fuse -o fuse-stream-mvp-headless .
+# Build CLI tool (headless, for testing/automation)
+go build -tags fuse -o fuse-stream-cli ./cmd/cli
 ```
 
-### macOS-specific notes
+### Build Tags Explained
 
-The `wails.json` configuration includes `"build:tags": "fuse"` which ensures FUSE support is always enabled for macOS builds. You can simply use:
-
-```bash
-# GUI build (includes FUSE support automatically)
-wails build -skipbindings
-
-# Headless build (for daemon-only mode)
-go build -tags fuse -o fuse-stream-mvp-headless .
-```
+- **GUI build**: `wails build -tags "production"` adds `production` tag, `wails.json` adds `fuse,gui` tags
+- **CLI build**: `go build -tags fuse` compiles with `fuse` tag (no `gui` tag)
+- Build tag guards ensure only one `main()` per build:
+  - `cmd/gui/main.go`: `//go:build gui`
+  - `cmd/cli/main.go`: `//go:build !gui`
 
 ### Run (local)
 
@@ -193,24 +191,27 @@ wails dev
 
 This launches the app with hot-reload for frontend changes and proper build tags.
 
-**Option 2: Production build**
+**Option 2: Production GUI build**
 
 ```bash
-# Build first (FUSE tag is automatic via wails.json)
-wails build -skipbindings
+# Build GUI app first
+wails build -tags "production" -skipbindings
 
 # Then run
 open ./build/bin/fuse-stream-mvp.app     # macOS
 ```
 
-**Option 3: Headless mode (no GUI)**
+**Option 3: CLI mode (no GUI)**
 
 ```bash
-# Build with FUSE support
-go build -tags fuse -o fuse-stream-mvp-headless .
+# Build CLI tool
+go build -tags fuse -o fuse-stream-cli ./cmd/cli
 
-# Run without GUI (daemon only)
-./fuse-stream-mvp-headless --headless
+# Run CLI (mount and keep alive)
+./fuse-stream-cli --mount
+
+# Or unmount
+./fuse-stream-cli --unmount
 ```
 
 This starts the daemon (FUSE mount + HTTP server) without launching a window. Useful for CI or manual testing.
