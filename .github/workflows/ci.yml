@@ -27,6 +27,28 @@ jobs:
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
         run: go test ./... -run Test -v -tags fuse
 
+  macos-api-tests:
+    runs-on: [self-hosted, macOS, ARM64, macFUSE]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm install
+          npm run build
+      - name: macOS API tests
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
+        run: |
+          echo "=== Running API tests on macOS ==="
+          go test ./... -run Test -v -tags fuse
+          echo "=== API tests completed ==="
+
   build-linux:
     runs-on: ubuntu-22.04
     timeout-minutes: 20

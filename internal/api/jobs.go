@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"time"
 )
 
 type Output struct {
@@ -23,33 +25,47 @@ type Job struct {
 type Client struct {
 	tokenCache *TokenCache
 	apiBase    string
+	httpClient *http.Client
 }
 
 func NewClient(apiBase, clientID, clientSecret string) *Client {
 	return &Client{
 		tokenCache: NewTokenCache(apiBase, clientID, clientSecret),
 		apiBase:    apiBase,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
 	}
 }
 
 func (c *Client) ListJobs() ([]Job, error) {
+	log.Printf("[API] ListJobs: Getting token...")
 	token, err := c.tokenCache.GetToken()
 	if err != nil {
+		log.Printf("[API] ListJobs: Token error: %v", err)
 		return nil, err
 	}
 
 	url := fmt.Sprintf("%s/jobs/?status=SUCCESS&expand=file", c.apiBase)
+	log.Printf("[API] ListJobs: Making request to %s", url)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create jobs request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		log.Printf("[API] ListJobs: Request error: %v", err)
 		return nil, fmt.Errorf("jobs request: %w", err)
 	}
 	defer resp.Body.Close()
+	log.Printf("[API] ListJobs: Response status: %d", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

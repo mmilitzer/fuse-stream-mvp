@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"time"
 )
 
 func (c *Client) BuildTempURL(fileID, autographTag string) (string, error) {
@@ -15,6 +16,12 @@ func (c *Client) BuildTempURL(fileID, autographTag string) (string, error) {
 		c.apiBase, fileID, autographTag)
 
 	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
