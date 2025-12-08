@@ -161,6 +161,7 @@ For most users, the default `temp-file` mode is recommended.
 go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
 # Production build (GUI app)
+# Note: wails.json is configured with "build:tags": "fuse", so -tags fuse is automatic
 wails build -skipbindings
 
 # Binary will be in build/bin/fuse-stream-mvp.app
@@ -169,15 +170,15 @@ wails build -skipbindings
 go build -tags fuse -o fuse-stream-mvp-headless .
 ```
 
-### macOS-specific builds
+### macOS-specific notes
 
-For FSKit-enabled builds (recommended on M3):
+The `wails.json` configuration includes `"build:tags": "fuse"` which ensures FUSE support is always enabled for macOS builds. You can simply use:
 
 ```bash
-# Build with FUSE support tag
-wails build -skipbindings -tags fuse
+# GUI build (includes FUSE support automatically)
+wails build -skipbindings
 
-# Or for headless:
+# Headless build (for daemon-only mode)
 go build -tags fuse -o fuse-stream-mvp-headless .
 ```
 
@@ -195,8 +196,8 @@ This launches the app with hot-reload for frontend changes and proper build tags
 **Option 2: Production build**
 
 ```bash
-# Build first
-wails build -skipbindings -tags fuse
+# Build first (FUSE tag is automatic via wails.json)
+wails build -skipbindings
 
 # Then run
 open ./build/bin/fuse-stream-mvp.app     # macOS

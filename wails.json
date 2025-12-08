@@ -19,5 +19,6 @@
     "copyright": "Copyright.........",
     "comments": "M1: Scaffold API + UI"
   },
-  "nsisType": "multiple"
+  "nsisType": "multiple",
+  "build:tags": "fuse"
 }

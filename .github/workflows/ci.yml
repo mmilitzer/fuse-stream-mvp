@@ -49,7 +49,8 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build Wails GUI app
         run: |
-          wails build -skipbindings -platform linux/amd64 -tags fuse
+          # Note: -tags fuse is automatic via wails.json "build:tags": "fuse"
+          wails build -skipbindings -platform linux/amd64
       - name: Build headless binary (for dev/testing)
         run: |
           mkdir -p build/bin
@@ -86,7 +87,8 @@ jobs:
 
       - name: Build Wails GUI app (macOS, FSKit/FUSE)
         run: |
-          wails build -skipbindings -tags fuse
+          # Note: -tags fuse is automatic via wails.json "build:tags": "fuse"
+          wails build -skipbindings
 
       - name: Build headless binary (macOS, FSKit/FUSE)
         run: |
