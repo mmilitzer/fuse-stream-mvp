@@ -80,7 +80,7 @@ func (a *App) GetJobs() ([]JobInfo, error) {
 func (a *App) GetJobsPaginated(req ListJobsRequest) (*ListJobsResult, error) {
 	// Set defaults
 	if req.PageSize == 0 {
-		req.PageSize = 20
+		req.PageSize = 6
 	}
 	if req.Page < 0 {
 		req.Page = 0
