@@ -49,8 +49,8 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build GUI with Wails
         run: |
-          # wails.json has build:tags="fuse,gui" and build:dir="cmd/gui"
-          wails build -tags "production" -skipbindings -platform linux/amd64
+          # Build GUI app with gui tag so root main.go is used (has //go:build gui)
+          wails build -tags "fuse,gui,production" -skipbindings -platform linux/amd64
       - name: Build headless CLI
         run: |
           mkdir -p build/bin
@@ -87,8 +87,8 @@ jobs:
 
       - name: Build GUI (.app) with Wails
         run: |
-          # wails.json has build:tags="fuse,gui" and build:dir="cmd/gui"
-          wails build -tags "production" -skipbindings
+          # Build GUI app with gui tag so root main.go is used (has //go:build gui)
+          wails build -tags "fuse,gui,production" -skipbindings
 
       - name: Build headless CLI
         run: |

@@ -155,7 +155,7 @@ For most users, the default `temp-file` mode is recommended.
 ### Build
 
 **Important:** GUI and CLI builds use separate entry points with build tags:
-- **GUI app**: `cmd/gui/main.go` (built with Wails, has `//go:build gui` tag)
+- **GUI app**: `main.go` at project root (built with Wails, has `//go:build gui` tag)
 - **CLI app**: `cmd/cli/main.go` (built with `go build`, has `//go:build !gui` tag)
 
 ```bash
@@ -163,8 +163,7 @@ For most users, the default `temp-file` mode is recommended.
 go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
 # Build GUI app (.app bundle)
-# wails.json has build:dir="cmd/gui" and build:tags="fuse,gui"
-wails build -tags "production" -skipbindings
+wails build -tags "fuse,gui,production" -skipbindings
 
 # Binary will be in build/bin/fuse-stream-mvp.app
 
@@ -174,10 +173,14 @@ go build -tags fuse -o fuse-stream-cli ./cmd/cli
 
 ### Build Tags Explained
 
-- **GUI build**: `wails build -tags "production"` adds `production` tag, `wails.json` adds `fuse,gui` tags
-- **CLI build**: `go build -tags fuse` compiles with `fuse` tag (no `gui` tag)
+- **GUI build**: Requires `gui` tag to compile root `main.go`
+  - Command: `wails build -tags "fuse,gui,production"`
+  - Tags: `fuse` (FUSE support), `gui` (enables GUI main), `production` (Wails optimization)
+- **CLI build**: Uses `!gui` tag to exclude root main.go
+  - Command: `go build -tags fuse -o fuse-stream-cli ./cmd/cli`
+  - Tags: `fuse` (FUSE support), no `gui` tag (enables CLI main)
 - Build tag guards ensure only one `main()` per build:
-  - `cmd/gui/main.go`: `//go:build gui`
+  - Root `main.go`: `//go:build gui`
   - `cmd/cli/main.go`: `//go:build !gui`
 
 ### Run (local)
@@ -195,7 +198,7 @@ This launches the app with hot-reload for frontend changes and proper build tags
 
 ```bash
 # Build GUI app first
-wails build -tags "production" -skipbindings
+wails build -tags "fuse,gui,production" -skipbindings
 
 # Then run
 open ./build/bin/fuse-stream-mvp.app     # macOS

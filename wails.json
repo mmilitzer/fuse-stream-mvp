@@ -19,7 +19,5 @@
     "copyright": "Copyright.........",
     "comments": "M1: Scaffold API + UI"
   },
-  "nsisType": "multiple",
-  "build:dir": "cmd/gui",
-  "build:tags": "fuse,gui"
+  "nsisType": "multiple"
 }
