@@ -229,8 +229,10 @@ Check cgofuse source and documentation:
 **Symptom:** Mount fails with permission error
 
 **Solution:**
-- Check mountpoint directory permissions
-- Ensure user has write access to parent directory
+- **For `/Volumes` mountpoints**: DO NOT create the directory manually - the macFUSE mount helper creates it
+- `/Volumes` is root-owned; applications cannot create directories there without root privileges
+- The `mount_macfuse` helper (setuid root) creates the mountpoint automatically during mounting
+- **For non-`/Volumes` mountpoints** (testing): Check directory permissions and ensure write access to parent
 - Check macFUSE preferences: `defaults read /Library/Preferences/com.github.macfuse`
 
 ### Issue 5: Stale Mounts

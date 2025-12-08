@@ -149,14 +149,27 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 // recoverStaleMountMacOS attempts to unmount any stale mount at the mountpoint
 // before we try to mount. This handles the case where the app crashed or was
 // force-quit without properly unmounting.
+//
+// FSKit Mounting Requirements:
+// - Mountpoints under /Volumes MUST NOT be created manually by the application
+// - /Volumes is root-owned and only the macFUSE mount helper (mount_macfuse) can create directories there
+// - The mount helper runs with setuid root privileges and creates the mountpoint automatically
+// - For non-/Volumes paths (e.g., testing), we create the directory manually
 func (fs *fuseFS) recoverStaleMountMacOS() error {
 	// Check if mountpoint is already mounted by checking if it's accessible
-	// and has a .fuse_hidden file (or similar FUSE marker)
 	_, err := os.Stat(fs.mountpoint)
 	if err != nil {
-		// Mountpoint doesn't exist or isn't accessible, nothing to recover
+		// Mountpoint doesn't exist or isn't accessible
 		if os.IsNotExist(err) {
-			log.Printf("[fs] Mount recovery: mountpoint doesn't exist, creating it")
+			// For paths under /Volumes, DO NOT create the directory manually
+			// The macFUSE mount helper will create it automatically
+			if strings.HasPrefix(fs.mountpoint, "/Volumes/") {
+				log.Printf("[fs] Mount recovery: mountpoint %s doesn't exist (expected for /Volumes paths - mount helper will create it)", fs.mountpoint)
+				return nil
+			}
+			
+			// For non-/Volumes paths (e.g., testing), create the directory
+			log.Printf("[fs] Mount recovery: creating non-/Volumes mountpoint %s", fs.mountpoint)
 			return os.MkdirAll(fs.mountpoint, 0755)
 		}
 		return nil

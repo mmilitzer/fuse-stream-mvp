@@ -145,6 +145,13 @@ For most users, the default `temp-file` mode is recommended.
 - More stable and secure than legacy kext approach
 - See: [macFUSE FSKit backend documentation](https://github.com/macfuse/macfuse/wiki/Getting-Started)
 
+**FSKit Mountpoint Requirements:**
+- **FSKit only supports mountpoints under `/Volumes/`** - Apple's hard limitation
+- `/Volumes/` is root-owned; applications **cannot** create directories there directly
+- The macFUSE mount helper (`mount_macfuse`) runs with setuid root privileges and creates the mountpoint automatically during mounting
+- **Do not manually create** `/Volumes/FuseStream/` - the mount process handles this
+- For testing with non-`/Volumes` paths (e.g., `~/test-mount`), the application will create the directory automatically
+
 ### Build
 
 **Important:** Wails applications **must** be built using the `wails` CLI (not `go build`) to include the required build tags.
