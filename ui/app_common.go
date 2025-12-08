@@ -37,6 +37,20 @@ type OutputInfo struct {
 	ContentType string `json:"contentType"`
 }
 
+type ListJobsRequest struct {
+	Page       int    `json:"page"`       // Page number (0-indexed)
+	PageSize   int    `json:"pageSize"`   // Items per page
+	NameFilter string `json:"nameFilter"` // Optional name filter
+}
+
+type ListJobsResult struct {
+	Jobs       []JobInfo `json:"jobs"`
+	Total      int       `json:"total"`
+	Page       int       `json:"page"`
+	PageSize   int       `json:"pageSize"`
+	TotalPages int       `json:"totalPages"`
+}
+
 func (a *App) GetJobs() ([]JobInfo, error) {
 	jobs, err := a.client.ListJobs()
 	if err != nil {
@@ -61,6 +75,63 @@ func (a *App) GetJobs() ([]JobInfo, error) {
 		})
 	}
 	return result, nil
+}
+
+func (a *App) GetJobsPaginated(req ListJobsRequest) (*ListJobsResult, error) {
+	// Set defaults
+	if req.PageSize == 0 {
+		req.PageSize = 20
+	}
+	if req.Page < 0 {
+		req.Page = 0
+	}
+
+	// Call API with pagination options
+	opts := api.ListJobsOptions{
+		Start:      req.Page * req.PageSize,
+		Limit:      req.PageSize,
+		Sort:       "created_at",
+		Direction:  "-1", // Newest first
+		NameFilter: req.NameFilter,
+	}
+
+	resp, err := a.client.ListJobsWithOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert jobs to UI format
+	jobs := make([]JobInfo, 0, len(resp.Jobs))
+	for _, job := range resp.Jobs {
+		outputs := make([]OutputInfo, 0, len(job.Outputs))
+		for _, out := range job.Outputs {
+			outputs = append(outputs, OutputInfo{
+				FileID:      out.FileID,
+				FileName:    out.FileName,
+				Size:        out.Size,
+				ContentType: out.ContentType,
+			})
+		}
+		jobs = append(jobs, JobInfo{
+			ID:        job.ID,
+			InputName: job.InputName,
+			Outputs:   outputs,
+		})
+	}
+
+	// Calculate total pages
+	totalPages := (resp.Total + req.PageSize - 1) / req.PageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	return &ListJobsResult{
+		Jobs:       jobs,
+		Total:      resp.Total,
+		Page:       req.Page,
+		PageSize:   req.PageSize,
+		TotalPages: totalPages,
+	}, nil
 }
 
 type StageRequest struct {

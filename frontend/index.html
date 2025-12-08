@@ -113,6 +113,40 @@
             border-radius: 4px;
             margin: 10px 0;
         }
+        .search-container {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
+            align-items: center;
+        }
+        .search-container input {
+            flex: 1;
+            margin: 0;
+        }
+        .search-container button {
+            margin: 0;
+        }
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .pagination button {
+            min-width: 40px;
+            padding: 8px 12px;
+        }
+        .pagination button.active {
+            background: #0056b3;
+            font-weight: bold;
+        }
+        .pagination .page-info {
+            color: #666;
+            font-size: 14px;
+            margin: 0 10px;
+        }
     </style>
 </head>
 <body>
@@ -120,8 +154,20 @@
         <!-- Screen A: List Jobs -->
         <div id="screen-jobs" class="screen active">
             <h1>Select a Job</h1>
+            
+            <!-- Search bar -->
+            <div class="search-container">
+                <input type="text" id="search-input" placeholder="Search jobs by file name..." />
+                <button id="btn-search">Search</button>
+                <button id="btn-clear-search">Clear</button>
+            </div>
+            
             <div class="info">Loading jobs from MediaHub...</div>
             <ul id="job-list" class="job-list"></ul>
+            
+            <!-- Pagination controls -->
+            <div id="pagination" class="pagination" style="display:none;"></div>
+            
             <button id="btn-refresh-jobs">Refresh Jobs</button>
         </div>
 
@@ -158,6 +204,10 @@
         let selectedJob = null;
         let selectedOutput = null;
         let stagedFilePath = null;
+        let currentPage = 0;
+        let pageSize = 20;
+        let currentFilter = '';
+        let totalPages = 1;
 
         function showScreen(screenId) {
             document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -175,28 +225,144 @@
             document.getElementById('error-message').style.display = 'none';
         }
 
-        function loadJobs() {
+        function loadJobs(page = 0, nameFilter = '') {
             const list = document.getElementById('job-list');
             const info = document.querySelector('#screen-jobs .info');
+            const pagination = document.getElementById('pagination');
+            
             info.textContent = 'Loading jobs...';
             list.innerHTML = '';
+            pagination.style.display = 'none';
 
-            // M1 stub: show mock data if API fails
-            window.go.ui.App.GetJobs()
-                .then(jobs => {
-                    info.textContent = jobs.length > 0 ? 'Select a job to continue:' : 'No jobs found.';
-                    jobs.forEach(job => {
-                        const li = document.createElement('li');
-                        li.className = 'job-item';
-                        li.textContent = job.inputName || job.id;
-                        li.onclick = () => selectJob(job);
-                        list.appendChild(li);
-                    });
+            currentPage = page;
+            currentFilter = nameFilter;
+
+            // Use paginated API
+            window.go.ui.App.GetJobsPaginated({
+                page: page,
+                pageSize: pageSize,
+                nameFilter: nameFilter
+            })
+                .then(result => {
+                    totalPages = result.totalPages;
+                    
+                    if (result.jobs.length > 0) {
+                        const showing = result.page * result.pageSize + 1;
+                        const showingEnd = Math.min((result.page + 1) * result.pageSize, result.total);
+                        info.textContent = `Showing ${showing}-${showingEnd} of ${result.total} jobs${nameFilter ? ` matching "${nameFilter}"` : ''}:`;
+                        
+                        result.jobs.forEach(job => {
+                            const li = document.createElement('li');
+                            li.className = 'job-item';
+                            li.textContent = job.inputName || job.id;
+                            li.onclick = () => selectJob(job);
+                            list.appendChild(li);
+                        });
+                        
+                        renderPagination(result);
+                    } else {
+                        info.textContent = nameFilter ? `No jobs found matching "${nameFilter}".` : 'No jobs found.';
+                    }
                 })
                 .catch(err => {
                     showError('Failed to load jobs: ' + err);
                     info.textContent = 'Error loading jobs.';
                 });
+        }
+
+        function renderPagination(result) {
+            const pagination = document.getElementById('pagination');
+            pagination.innerHTML = '';
+            
+            if (result.totalPages <= 1) {
+                pagination.style.display = 'none';
+                return;
+            }
+            
+            pagination.style.display = 'flex';
+            
+            // Previous button
+            const prevBtn = document.createElement('button');
+            prevBtn.textContent = '← Prev';
+            prevBtn.disabled = result.page === 0;
+            prevBtn.onclick = () => loadJobs(result.page - 1, currentFilter);
+            pagination.appendChild(prevBtn);
+            
+            // Page numbers
+            const maxPageButtons = 7;
+            let startPage = Math.max(0, result.page - Math.floor(maxPageButtons / 2));
+            let endPage = Math.min(result.totalPages - 1, startPage + maxPageButtons - 1);
+            
+            // Adjust start if we're near the end
+            if (endPage - startPage < maxPageButtons - 1) {
+                startPage = Math.max(0, endPage - maxPageButtons + 1);
+            }
+            
+            // First page if not visible
+            if (startPage > 0) {
+                const firstBtn = document.createElement('button');
+                firstBtn.textContent = '1';
+                firstBtn.onclick = () => loadJobs(0, currentFilter);
+                pagination.appendChild(firstBtn);
+                
+                if (startPage > 1) {
+                    const ellipsis = document.createElement('span');
+                    ellipsis.className = 'page-info';
+                    ellipsis.textContent = '...';
+                    pagination.appendChild(ellipsis);
+                }
+            }
+            
+            // Page buttons
+            for (let i = startPage; i <= endPage; i++) {
+                const btn = document.createElement('button');
+                btn.textContent = i + 1;
+                if (i === result.page) {
+                    btn.className = 'active';
+                }
+                btn.onclick = () => loadJobs(i, currentFilter);
+                pagination.appendChild(btn);
+            }
+            
+            // Last page if not visible
+            if (endPage < result.totalPages - 1) {
+                if (endPage < result.totalPages - 2) {
+                    const ellipsis = document.createElement('span');
+                    ellipsis.className = 'page-info';
+                    ellipsis.textContent = '...';
+                    pagination.appendChild(ellipsis);
+                }
+                
+                const lastBtn = document.createElement('button');
+                lastBtn.textContent = result.totalPages;
+                lastBtn.onclick = () => loadJobs(result.totalPages - 1, currentFilter);
+                pagination.appendChild(lastBtn);
+            }
+            
+            // Next button
+            const nextBtn = document.createElement('button');
+            nextBtn.textContent = 'Next →';
+            nextBtn.disabled = result.page >= result.totalPages - 1;
+            nextBtn.onclick = () => loadJobs(result.page + 1, currentFilter);
+            pagination.appendChild(nextBtn);
+            
+            // Page info
+            const pageInfo = document.createElement('span');
+            pageInfo.className = 'page-info';
+            pageInfo.textContent = `Page ${result.page + 1} of ${result.totalPages}`;
+            pagination.appendChild(pageInfo);
+        }
+
+        function doSearch() {
+            const searchInput = document.getElementById('search-input');
+            const filter = searchInput.value.trim();
+            loadJobs(0, filter); // Reset to first page when searching
+        }
+
+        function clearSearch() {
+            const searchInput = document.getElementById('search-input');
+            searchInput.value = '';
+            loadJobs(0, ''); // Reset to first page with no filter
         }
 
         function selectJob(job) {
@@ -313,10 +479,19 @@
         }
 
         // Event listeners
-        document.getElementById('btn-refresh-jobs').onclick = loadJobs;
+        document.getElementById('btn-refresh-jobs').onclick = () => loadJobs(currentPage, currentFilter);
+        document.getElementById('btn-search').onclick = doSearch;
+        document.getElementById('btn-clear-search').onclick = clearSearch;
         document.getElementById('btn-back-to-jobs').onclick = () => showScreen('screen-jobs');
         document.getElementById('btn-back-to-outputs').onclick = () => showOutputs(selectedJob);
         document.getElementById('btn-stage').onclick = stageForUpload;
+
+        // Enter key on search input
+        document.getElementById('search-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                doSearch();
+            }
+        });
 
         // Initialize
         loadJobs();
