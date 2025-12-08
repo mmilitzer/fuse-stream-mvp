@@ -127,34 +127,44 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// Mount in goroutine
-	mountDone := make(chan bool, 1)
+	// Note: host.Mount() is blocking and runs the FUSE event loop
+	// It only returns when unmounted or if mount fails immediately
+	mountErr := make(chan error, 1)
 	go func() {
 		log.Println("Attempting to mount...")
 		success := host.Mount(*mountpoint, mountOpts)
-		mountDone <- success
-		if success {
-			log.Println("Mount completed successfully")
+		if !success {
+			log.Println("❌ Mount call returned false (mount failed)")
+			mountErr <- fmt.Errorf("mount failed")
 		} else {
-			log.Println("Mount failed")
+			log.Println("Mount call returned (filesystem unmounted)")
 		}
 	}()
 
-	// Wait for mount or timeout
-	select {
-	case success := <-mountDone:
-		if !success {
-			log.Fatalf("❌ Mount failed")
-			os.Exit(1)
+	// Wait for filesystem to be ready by checking if we can access it
+	log.Println("Waiting for filesystem to be ready...")
+	deadline := time.Now().Add(5 * time.Second)
+	mounted := false
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-mountErr:
+			log.Fatalf("❌ Mount failed: %v", err)
+		default:
+			// Try to read the directory to confirm FUSE is responding
+			time.Sleep(100 * time.Millisecond)
+			if _, err := os.ReadDir(*mountpoint); err == nil {
+				log.Println("✅ Filesystem is ready and responding!")
+				mounted = true
+				goto mounted_success
+			}
 		}
-		log.Println("✅ Mount succeeded!")
-		
-	case <-time.After(5 * time.Second):
-		log.Fatalf("❌ Mount timed out after 5 seconds")
-		os.Exit(1)
 	}
 
-	// Wait for filesystem to be ready
-	time.Sleep(500 * time.Millisecond)
+	if !mounted {
+		log.Fatalf("❌ Mount timed out - filesystem not responding after 5 seconds")
+	}
+
+mounted_success:
 
 	// Test filesystem access
 	log.Println("\n=== Testing Filesystem Access ===")

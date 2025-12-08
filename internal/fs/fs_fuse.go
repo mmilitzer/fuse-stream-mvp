@@ -112,12 +112,16 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 	}
 
 	// Mount the filesystem
-	mountResult := make(chan bool, 1)
+	// Note: host.Mount() is a blocking call that runs the FUSE event loop.
+	// It only returns when the filesystem is unmounted or if mount fails immediately.
+	// So we need to run it in a goroutine and verify the mount succeeded by checking
+	// if the filesystem is accessible.
+	mountErr := make(chan error, 1)
 	go func() {
+		log.Printf("[fs] Starting FUSE mount at %s", fs.mountpoint)
 		success := fs.host.Mount(fs.mountpoint, mountOpts)
-		mountResult <- success
 		if !success {
-			log.Printf("[fs] Failed to mount filesystem at %s", fs.mountpoint)
+			log.Printf("[fs] Mount call returned false (mount failed)")
 			if runtime.GOOS == "darwin" {
 				log.Printf("[fs] ERROR: Mount failed. This may indicate:")
 				log.Printf("[fs]   - macFUSE is not installed or is too old (requires macFUSE ≥5)")
@@ -126,24 +130,36 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 				log.Printf("[fs]   - Mountpoint is already in use or inaccessible")
 				log.Printf("[fs] Install macFUSE with FSKit support from: https://macfuse.io/")
 			}
+			mountErr <- fmt.Errorf("mount call failed at %s", fs.mountpoint)
+		} else {
+			log.Printf("[fs] Mount call returned (filesystem unmounted)")
 		}
 	}()
 
-	// Wait for mount to complete (with timeout)
-	select {
-	case success := <-mountResult:
-		if !success {
-			return fmt.Errorf("mount failed at %s (see logs for details)", fs.mountpoint)
+	// Wait for filesystem to be ready by checking if we can access the mountpoint
+	// The Mount() call above is blocking and won't return until unmount, so we
+	// verify the mount by checking if the filesystem responds to operations
+	log.Printf("[fs] Waiting for filesystem to be ready...")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-mountErr:
+			// Mount failed immediately
+			return err
+		default:
+			// Check if mount is ready by trying to read the directory
+			// This triggers a FUSE operation (Readdir) which confirms the filesystem is responding
+			time.Sleep(100 * time.Millisecond)
+			if _, err := os.ReadDir(fs.mountpoint); err == nil {
+				log.Printf("[fs] Filesystem is ready and responding to operations")
+				fs.mounted = true
+				return nil
+			}
 		}
-		fs.mounted = true
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("mount timed out at %s", fs.mountpoint)
 	}
 	
-	// Additional wait for filesystem to be fully ready
-	time.Sleep(100 * time.Millisecond)
-	
-	return nil
+	// Timeout - mount didn't become ready in time
+	return fmt.Errorf("mount timed out at %s - filesystem not responding", fs.mountpoint)
 }
 
 // recoverStaleMountMacOS attempts to unmount any stale mount at the mountpoint
