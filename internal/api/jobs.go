@@ -118,10 +118,7 @@ func (c *Client) ListJobsWithOptions(opts ListJobsOptions) (*JobsResponse, error
 	}
 
 	// Extract total count if available
-	total := 0
-	if totalVal, ok := data["total"]; ok {
-		total = int(getInt64(data, "total"))
-	}
+	total := int(getInt64(data, "total"))
 
 	jobsArray, ok := data["jobs"].([]any)
 	if !ok {
