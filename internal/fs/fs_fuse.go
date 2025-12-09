@@ -264,11 +264,33 @@ func (fs *fuseFS) Stop() error {
 	fs.cancel()
 	if fs.host != nil {
 		log.Println("[fs] Unmounting filesystem...")
-		if !fs.host.Unmount() {
-			log.Println("[fs] Normal unmount failed")
-			return fmt.Errorf("failed to unmount filesystem")
+		
+		// Try normal unmount with timeout
+		unmountDone := make(chan bool, 1)
+		go func() {
+			success := fs.host.Unmount()
+			unmountDone <- success
+		}()
+		
+		select {
+		case success := <-unmountDone:
+			if success {
+				log.Println("[fs] Filesystem unmounted successfully")
+				fs.mounted = false
+				return nil
+			}
+			log.Println("[fs] Normal unmount failed, trying force unmount...")
+		case <-time.After(3 * time.Second):
+			log.Println("[fs] Unmount timed out after 3s, trying force unmount...")
 		}
-		log.Println("[fs] Filesystem unmounted successfully")
+		
+		// Normal unmount failed or timed out, try force unmount
+		if err := fs.ForceUnmount(); err != nil {
+			log.Printf("[fs] Force unmount also failed: %v", err)
+			return fmt.Errorf("failed to unmount filesystem (normal and force unmount failed)")
+		}
+		fs.mounted = false
+		return nil
 	}
 	fs.mounted = false
 	return nil
