@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
-	"github.com/mmilitzer/fuse-stream-mvp/internal/appdelegate"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/drag"
 )
@@ -41,21 +41,6 @@ func GetAppInstance() *App {
 
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
-	
-	// Install macOS app delegate for proper termination handling
-	// Must be done after Wails initializes NSApplication
-	appdelegate.Install(
-		func() bool {
-			// Check if there are active uploads
-			return a.HasActiveUploads()
-		},
-		func() error {
-			// Unmount filesystem before termination
-			log.Println("[appdelegate] Unmount requested")
-			return daemon.UnmountFS()
-		},
-	)
-	log.Println("[main] App delegate installed in OnStartup")
 }
 
 type JobInfo struct {
@@ -276,12 +261,16 @@ func (a *App) EvictAllStagedFiles() error {
 }
 
 // HasActiveUploads returns true if there are active file handles open (uploads in progress).
-// The frontend should call this before allowing window close and show a confirmation dialog
-// if uploads are active.
 func (a *App) HasActiveUploads() bool {
 	filesystem := daemon.GetFS()
 	if filesystem == nil {
 		return false
 	}
 	return filesystem.HasActiveUploads()
+}
+
+// ShowQuitConfirmation shows a native confirmation dialog and quits if user confirms.
+// This is called asynchronously from OnBeforeClose when there are active uploads.
+func (a *App) ShowQuitConfirmation() {
+	showQuitConfirmationDialog()
 }

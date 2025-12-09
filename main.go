@@ -99,11 +99,26 @@ func main() {
 			Assets: frontend.Assets,
 		},
 		OnStartup: app.Startup,
-		// OnBeforeClose: removed - macOS app delegate now handles termination properly
-		// This prevents the deadlock caused by dispatch_sync on the main thread
+		OnBeforeClose: func(ctx context.Context) bool {
+			// Check if there are active uploads
+			if !app.HasActiveUploads() {
+				// No uploads, allow close immediately
+				log.Println("[main] No active uploads, allowing window close")
+				return false // false = allow close
+			}
+			
+			// Active uploads detected - show confirmation on main thread asynchronously
+			log.Println("[main] Active uploads detected, user will be prompted")
+			go app.ShowQuitConfirmation()
+			return true // true = prevent close for now, will quit programmatically if user confirms
+		},
 		OnShutdown: func(ctx context.Context) {
 			log.Println("[main] Shutting down application")
 			cancel() // Trigger daemon shutdown
+			// Unmount filesystem
+			if err := daemon.UnmountFS(); err != nil {
+				log.Printf("[main] Warning: failed to unmount: %v", err)
+			}
 		},
 		Bind: []interface{}{
 			app,
