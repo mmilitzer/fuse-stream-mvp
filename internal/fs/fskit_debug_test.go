@@ -17,13 +17,13 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 )
 
-// Test 1: Check macFUSE installation and version
-func TestFSKit_MacFUSEInstallation(t *testing.T) {
+// Test 1: Check FSKit support (user-space only, no kext)
+func TestFSKit_FSKitSupport(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("=== Test 1: Checking macFUSE Installation ===")
+	log.Println("=== Test 1: Checking FSKit Support (User-Space) ===")
 
 	// Check if macFUSE is installed
 	checkCmd := func(name string, args ...string) {
@@ -38,11 +38,10 @@ func TestFSKit_MacFUSEInstallation(t *testing.T) {
 		}
 	}
 
-	// Check for macFUSE installation
-	log.Println("\n--- Checking for macFUSE installation ---")
+	// Check for macFUSE installation (user-space mount helper)
+	log.Println("\n--- Checking for macFUSE user-space helper ---")
 	checkCmd("which", "mount_macfuse")
 	checkCmd("ls", "-la", "/Library/Filesystems/macfuse.fs")
-	checkCmd("ls", "-la", "/Library/Extensions/macfuse.kext")
 	
 	// Check macFUSE version
 	log.Println("\n--- Checking macFUSE version ---")
@@ -52,90 +51,15 @@ func TestFSKit_MacFUSEInstallation(t *testing.T) {
 	log.Println("\n--- Checking for FSKit support ---")
 	checkCmd("ls", "-la", "/Library/Filesystems/macfuse.fs/Contents/Resources")
 	checkCmd("sh", "-c", "system_profiler SPSoftwareDataType | grep 'System Version'")
-	
-	// Check loaded kernel extensions
-	log.Println("\n--- Checking loaded kernel extensions ---")
-	checkCmd("kextstat", "-l", "-b", "com.github.osxfuse.filesystems.osxfuse")
-	checkCmd("kextstat", "-l", "-b", "io.macfuse.filesystems.macfuse")
 }
 
-// Test 2: Simple FUSE filesystem test (no FSKit)
-func TestFSKit_BasicFUSEMount(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Skipping macOS-specific test")
-	}
-
-	log.Println("\n=== Test 2: Basic FUSE Mount (no FSKit option) ===")
-
-	// Create a simple in-memory filesystem
-	fs := &simpleTestFS{}
-	
-	// Create temporary mountpoint
-	mountpoint := filepath.Join(os.TempDir(), fmt.Sprintf("fuse-test-basic-%d", time.Now().Unix()))
-	if err := os.MkdirAll(mountpoint, 0755); err != nil {
-		t.Fatalf("Failed to create mountpoint: %v", err)
-	}
-	defer os.RemoveAll(mountpoint)
-
-	log.Printf("Mountpoint: %s", mountpoint)
-
-	// Try mounting without FSKit option
-	host := fuse.NewFileSystemHost(fs)
-	
-	mountOpts := []string{
-		"-o", "ro",
-		"-o", "fsname=fusetest",
-		"-o", "local",
-		"-o", "volname=FuseTest",
-	}
-	
-	log.Printf("Mount options: %v", mountOpts)
-
-	// Mount in goroutine
-	mountResult := make(chan bool, 1)
-	go func() {
-		success := host.Mount(mountpoint, mountOpts)
-		mountResult <- success
-		log.Printf("Mount result: %v", success)
-	}()
-
-	// Wait for mount with timeout
-	select {
-	case success := <-mountResult:
-		if !success {
-			t.Errorf("❌ Basic FUSE mount failed (no FSKit option)")
-		} else {
-			log.Println("✅ Basic FUSE mount succeeded")
-			time.Sleep(500 * time.Millisecond)
-			
-			// Try to access the mountpoint
-			entries, err := os.ReadDir(mountpoint)
-			if err != nil {
-				log.Printf("⚠️  Warning: Could not read mountpoint: %v", err)
-			} else {
-				log.Printf("✅ Successfully read mountpoint, %d entries", len(entries))
-			}
-			
-			// Unmount
-			if !host.Unmount() {
-				log.Println("⚠️  Warning: Unmount returned false")
-			} else {
-				log.Println("✅ Unmount succeeded")
-			}
-		}
-	case <-time.After(10 * time.Second):
-		t.Errorf("❌ Basic FUSE mount timed out")
-		host.Unmount()
-	}
-}
-
-// Test 3: FUSE mount with FSKit option (backend=fskit)
+// Test 2: FUSE mount with FSKit option (backend=fskit)
 func TestFSKit_FSKitBackendMount(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("\n=== Test 3: FUSE Mount with backend=fskit ===")
+	log.Println("\n=== Test 2: FUSE Mount with backend=fskit ===")
 
 	fs := &simpleTestFS{}
 	
@@ -194,13 +118,13 @@ func TestFSKit_FSKitBackendMount(t *testing.T) {
 	}
 }
 
-// Test 4: Try different FSKit option formats
+// Test 3: Try different FSKit option formats
 func TestFSKit_DifferentOptionFormats(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("\n=== Test 4: Testing Different FSKit Option Formats ===")
+	log.Println("\n=== Test 3: Testing Different FSKit Option Formats ===")
 
 	testCases := []struct {
 		name string
@@ -263,13 +187,13 @@ func TestFSKit_DifferentOptionFormats(t *testing.T) {
 	}
 }
 
-// Test 5: Verify mount recovery mechanism
+// Test 4: Verify mount recovery mechanism
 func TestFSKit_MountRecovery(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("\n=== Test 5: Mount Recovery Mechanism ===")
+	log.Println("\n=== Test 4: Mount Recovery Mechanism ===")
 
 	mountpoint := filepath.Join(os.TempDir(), fmt.Sprintf("fuse-test-recovery-%d", time.Now().Unix()))
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
@@ -304,13 +228,13 @@ func TestFSKit_MountRecovery(t *testing.T) {
 	}
 }
 
-// Test 6: Check mount command execution details
+// Test 5: Check mount command execution details
 func TestFSKit_MountCommandDetails(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("\n=== Test 6: Mount Command Details ===")
+	log.Println("\n=== Test 5: Mount Command Details ===")
 
 	// Try to understand what cgofuse is doing under the hood
 	log.Println("\n--- Checking current mounts ---")
@@ -362,13 +286,13 @@ func TestFSKit_MountCommandDetails(t *testing.T) {
 	}
 }
 
-// Test 7: Full integration test matching actual code
+// Test 6: Full integration test matching actual code
 func TestFSKit_FullIntegration(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
 	}
 
-	log.Println("\n=== Test 7: Full Integration Test (Matching Actual Code) ===")
+	log.Println("\n=== Test 6: Full Integration Test (Matching Actual Code) ===")
 
 	fs := &simpleTestFS{}
 	

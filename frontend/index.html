@@ -80,6 +80,7 @@
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             border-radius: 8px;
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             color: white;
@@ -88,6 +89,20 @@
             cursor: move;
             box-shadow: 0 4px 12px rgba(0,0,0,0.2);
             position: relative;
+            padding: 20px;
+            text-align: center;
+        }
+        .drag-tile-header {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 12px;
+        }
+        .drag-tile-recipient {
+            font-size: 14px;
+            font-weight: normal;
+            opacity: 0.9;
+            word-break: break-word;
+            max-width: 100%;
         }
         .drag-tile.disabled {
             background: #ccc;
@@ -196,7 +211,8 @@
             
             <!-- Drag tile (shown after staging) -->
             <div id="drag-tile" class="drag-tile" style="display:none;" draggable="false">
-                Drag to Upload
+                <div class="drag-tile-header">Drag to Upload</div>
+                <div id="drag-tile-recipient" class="drag-tile-recipient"></div>
             </div>
             <div id="staged-path" class="info" style="display:none;"></div>
         </div>
@@ -210,8 +226,9 @@
         let selectedJob = null;
         let selectedOutput = null;
         let stagedFilePath = null;
+        let stagedRecipient = null;
         let currentPage = 0;
-        let pageSize = 6;
+        let pageSize = 5;
         let currentFilter = '';
         let totalPages = 1;
 
@@ -428,10 +445,16 @@
             .then(resp => {
                 if (resp.success) {
                     stagedFilePath = resp.filePath;
+                    stagedRecipient = recipientTag;
+                    
                     const dragTile = document.getElementById('drag-tile');
                     dragTile.style.display = 'flex';
                     dragTile.classList.remove('disabled');
                     dragTile.removeAttribute('title');
+                    
+                    // Update recipient identifier on the tile
+                    document.getElementById('drag-tile-recipient').textContent = recipientTag;
+                    
                     document.getElementById('staged-path').textContent = 
                         `File path: ${resp.filePath}\n${resp.message}`;
                     document.getElementById('staged-path').style.display = 'block';
