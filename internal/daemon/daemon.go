@@ -59,10 +59,22 @@ func Start(ctx context.Context, mountpoint string, client *api.Client, cfg *conf
 		<-daemonCtx.Done()
 		log.Println("[daemon] Shutting down...")
 		
-		// Release resources but don't try to unmount - unmounting from a
-		// goroutine while the main thread is exiting can deadlock with cgofuse.
-		// The OS will automatically clean up the FUSE mount when the process exits.
+		// Release resources (app nap, sleep prevention, evict files)
 		filesystem.ReleaseResources()
+		
+		// Trigger unmount in a separate goroutine so we don't block shutdown
+		// The FUSE mount goroutine needs Unmount() to be called to complete,
+		// otherwise it blocks forever and prevents app exit
+		go func() {
+			log.Println("[daemon] Triggering async unmount...")
+			// Call Stop() which will call Unmount() internally
+			// Resources are already released, so this just does the unmount
+			if err := filesystem.Stop(); err != nil {
+				log.Printf("[daemon] Error during unmount: %v", err)
+			} else {
+				log.Println("[daemon] Unmount completed")
+			}
+		}()
 		
 		log.Println("[daemon] Shutdown complete")
 	}()

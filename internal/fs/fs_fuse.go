@@ -65,6 +65,10 @@ type fuseFS struct {
 	// App Nap prevention (NSProcessInfo activity - prevents process throttling)
 	appNapRelease func()
 	appNapMu      sync.Mutex
+	
+	// Resource management
+	resourcesReleased bool
+	resourcesMu       sync.Mutex
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
@@ -244,6 +248,14 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 // to prevent deadlocks - the OS will automatically clean up the FUSE mount when
 // the process exits.
 func (fs *fuseFS) ReleaseResources() {
+	fs.resourcesMu.Lock()
+	defer fs.resourcesMu.Unlock()
+	
+	if fs.resourcesReleased {
+		return // Already released
+	}
+	fs.resourcesReleased = true
+	
 	// Evict all staged files to clean up BackingStores
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("[fs] Error evicting staged files: %v", err)
@@ -268,14 +280,16 @@ func (fs *fuseFS) ReleaseResources() {
 	// Cancel context to signal any ongoing operations to stop
 	fs.cancel()
 	
-	log.Println("[fs] Resources released, OS will clean up mount on process exit")
+	log.Println("[fs] Resources released")
 }
 
 func (fs *fuseFS) Stop() error {
-	// Release resources first
 	fs.ReleaseResources()
-	
-	// Now attempt unmount
+	return fs.Unmount()
+}
+
+// Unmount attempts to unmount the FUSE filesystem without releasing resources
+func (fs *fuseFS) Unmount() error {
 	if fs.host != nil {
 		log.Println("[fs] Unmounting filesystem...")
 		if !fs.host.Unmount() {
