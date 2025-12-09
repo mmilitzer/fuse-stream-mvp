@@ -59,7 +59,8 @@ func main() {
 	}
 
 	// Set up lifecycle observer for foreground/background events
-	cleanupLifecycle, err := lifecycle.ObserveActivation(func(active bool) {
+	var cleanupLifecycle func()
+	cleanupLifecycle, err = lifecycle.ObserveActivation(func(active bool) {
 		if active {
 			log.Printf("[lifecycle] App became active (foreground)")
 		} else {
@@ -84,8 +85,7 @@ func main() {
 	if err != nil {
 		log.Printf("Warning: Failed to observe lifecycle events: %v", err)
 		// Continue anyway
-	} else {
-		defer cleanupLifecycle()
+		cleanupLifecycle = nil
 	}
 
 	// Launch Wails GUI
@@ -114,7 +114,16 @@ func main() {
 		},
 		OnShutdown: func(ctx context.Context) {
 			log.Println("[main] Shutting down application")
+			
+			// Stop lifecycle observer FIRST to prevent any new fs.Stat() calls
+			// during unmount (which would deadlock)
+			if cleanupLifecycle != nil {
+				log.Println("[main] Stopping lifecycle observer")
+				cleanupLifecycle()
+			}
+			
 			cancel() // Trigger daemon shutdown
+			
 			// Unmount filesystem
 			if err := daemon.UnmountFS(); err != nil {
 				log.Printf("[main] Warning: failed to unmount: %v", err)
