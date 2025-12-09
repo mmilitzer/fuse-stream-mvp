@@ -6,7 +6,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -100,22 +99,7 @@ func main() {
 			Assets: frontend.Assets,
 		},
 		OnStartup: app.Startup,
-		OnBeforeClose: func(ctx context.Context) bool {
-			// Check if there are active uploads
-			if !app.HasActiveUploads() {
-				// No uploads, allow close immediately
-				log.Println("[main] No active uploads, allowing window close")
-				return false // false = allow close
-			}
-			
-			// Active uploads detected - show confirmation on main thread asynchronously
-			log.Println("[main] Active uploads detected, user will be prompted")
-			go app.ShowQuitConfirmation()
-			return true // true = prevent close for now, will quit programmatically if user confirms
-		},
 		OnShutdown: func(ctx context.Context) {
-			log.Println("[main] Shutting down application")
-			
 			// Stop lifecycle observer FIRST to prevent any new fs.Stat() calls
 			// during unmount (which would deadlock)
 			if cleanupLifecycle != nil {
@@ -123,15 +107,7 @@ func main() {
 				cleanupLifecycle()
 			}
 			
-			// Trigger daemon shutdown - the daemon's goroutine will handle
-			// unmounting asynchronously. We don't wait for it to complete here
-			// because OnShutdown might be running on the main thread, and calling
-			// fs.host.Unmount() synchronously from the main thread can deadlock
-			// with the FUSE event loop.
-			cancel()
-			
-			// Give the daemon a moment to start unmounting before the app exits
-			time.Sleep(100 * time.Millisecond)
+			cancel() // Trigger daemon shutdown
 		},
 		Bind: []interface{}{
 			app,

@@ -59,9 +59,11 @@ func Start(ctx context.Context, mountpoint string, client *api.Client, cfg *conf
 		<-daemonCtx.Done()
 		log.Println("[daemon] Shutting down...")
 		
-		// Stop the filesystem (this unmounts and releases resources)
+		// Give time for active operations to complete
+		time.Sleep(100 * time.Millisecond)
+		
 		if err := filesystem.Stop(); err != nil {
-			log.Printf("[daemon] Error during shutdown: %v", err)
+			log.Printf("[daemon] Error stopping filesystem: %v", err)
 		}
 		
 		log.Println("[daemon] Shutdown complete")
