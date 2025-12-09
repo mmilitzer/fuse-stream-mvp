@@ -3,6 +3,7 @@
 package appnap
 
 /*
+#cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework Foundation
 #import <Foundation/Foundation.h>
 

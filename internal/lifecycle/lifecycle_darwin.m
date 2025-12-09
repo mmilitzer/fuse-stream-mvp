@@ -32,10 +32,7 @@ extern void FSMVP_OnActivationChange(int callbackID, int active);
     return self;
 }
 
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    NSLog(@"[lifecycle] Stopped observing activation events (callback ID: %d)", _callbackID);
-}
+
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
     NSLog(@"[lifecycle] Application became active (foreground)");

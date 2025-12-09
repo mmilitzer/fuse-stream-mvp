@@ -3,6 +3,7 @@
 package lifecycle
 
 /*
+#cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework Cocoa -framework Foundation
 // Forward declaration of C functions
 int FSMVP_StartObservingActivation(int callbackID);
