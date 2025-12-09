@@ -3,8 +3,6 @@ package ui
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
 	"sync"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
