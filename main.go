@@ -13,7 +13,6 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
-	"github.com/mmilitzer/fuse-stream-mvp/internal/lifecycle"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/signals"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
@@ -57,21 +56,6 @@ func main() {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
 
-	// Set up lifecycle observer for foreground/background events
-	var cleanupLifecycle func()
-	cleanupLifecycle, err = lifecycle.ObserveActivation(func(active bool) {
-		if active {
-			log.Printf("[lifecycle] App became active (foreground)")
-		} else {
-			log.Printf("[lifecycle] App resigned active (background)")
-		}
-	})
-	if err != nil {
-		log.Printf("Warning: Failed to observe lifecycle events: %v", err)
-		// Continue anyway
-		cleanupLifecycle = nil
-	}
-
 	// Launch Wails GUI
 	app := ui.NewApp(client)
 
@@ -84,12 +68,6 @@ func main() {
 		},
 		OnStartup: app.Startup,
 		OnShutdown: func(ctx context.Context) {
-			// Stop lifecycle observer first
-			if cleanupLifecycle != nil {
-				log.Println("[main] Stopping lifecycle observer")
-				cleanupLifecycle()
-			}
-			
 			cancel() // Trigger daemon shutdown
 		},
 		Bind: []interface{}{
