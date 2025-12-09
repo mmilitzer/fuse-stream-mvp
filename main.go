@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
