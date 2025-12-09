@@ -17,6 +17,35 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 )
 
+// isGraphicalSession checks if we're running in a graphical user session
+// FUSE mounts require a full user session context to work properly
+func isGraphicalSession() bool {
+	// Check if we're in CI environment
+	if os.Getenv("CI") != "" {
+		return false
+	}
+	
+	// Check if DISPLAY or related environment variables are set
+	// On macOS, check for proper user session
+	if runtime.GOOS == "darwin" {
+		// Check if running as a console user (has GUI access)
+		cmd := exec.Command("stat", "-f", "%Su", "/dev/console")
+		output, err := cmd.Output()
+		if err != nil {
+			return false
+		}
+		consoleUser := strings.TrimSpace(string(output))
+		currentUser := os.Getenv("USER")
+		
+		// If we're not the console user, we probably don't have GUI access
+		if consoleUser != currentUser {
+			return false
+		}
+	}
+	
+	return true
+}
+
 // Test 1: Check FSKit support (user-space only, no kext)
 func TestFSKit_FSKitSupport(t *testing.T) {
 	if runtime.GOOS != "darwin" {
@@ -57,6 +86,10 @@ func TestFSKit_FSKitSupport(t *testing.T) {
 func TestFSKit_FSKitBackendMount(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
+	}
+	
+	if !isGraphicalSession() {
+		t.Skip("Skipping mount test: requires graphical user session (not available in CI/SSH)")
 	}
 
 	log.Println("\n=== Test 2: FUSE Mount with backend=fskit ===")
@@ -122,6 +155,10 @@ func TestFSKit_FSKitBackendMount(t *testing.T) {
 func TestFSKit_DifferentOptionFormats(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
+	}
+	
+	if !isGraphicalSession() {
+		t.Skip("Skipping mount test: requires graphical user session (not available in CI/SSH)")
 	}
 
 	log.Println("\n=== Test 3: Testing Different FSKit Option Formats ===")
@@ -290,6 +327,10 @@ func TestFSKit_MountCommandDetails(t *testing.T) {
 func TestFSKit_FullIntegration(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skipping macOS-specific test")
+	}
+	
+	if !isGraphicalSession() {
+		t.Skip("Skipping mount test: requires graphical user session (not available in CI/SSH)")
 	}
 
 	log.Println("\n=== Test 6: Full Integration Test (Matching Actual Code) ===")
