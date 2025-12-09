@@ -65,21 +65,6 @@ func main() {
 			log.Printf("[lifecycle] App became active (foreground)")
 		} else {
 			log.Printf("[lifecycle] App resigned active (background)")
-			
-			// Optionally: Test filesystem responsiveness after going to background
-			// This can help detect latent deadlocks early
-			fs := daemon.GetFS()
-			if fs != nil && fs.Mounted() {
-				go func() {
-					mp := fs.Mountpoint()
-					log.Printf("[lifecycle] Testing FS responsiveness at %s", mp)
-					if _, err := os.Stat(mp); err != nil {
-						log.Printf("[lifecycle] WARNING: FS unresponsive after resign active: %v", err)
-					} else {
-						log.Printf("[lifecycle] FS responsive after resign active")
-					}
-				}()
-			}
 		}
 	})
 	if err != nil {
@@ -100,8 +85,7 @@ func main() {
 		},
 		OnStartup: app.Startup,
 		OnShutdown: func(ctx context.Context) {
-			// Stop lifecycle observer FIRST to prevent any new fs.Stat() calls
-			// during unmount (which would deadlock)
+			// Stop lifecycle observer first
 			if cleanupLifecycle != nil {
 				log.Println("[main] Stopping lifecycle observer")
 				cleanupLifecycle()
