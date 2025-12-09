@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/appnap"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/sleep"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
@@ -57,9 +58,13 @@ type fuseFS struct {
 	fhToStagedID  map[uint64]string  // Maps file handle to staged file ID
 	fhMu          sync.RWMutex
 	
-	// Sleep prevention
+	// Sleep prevention (IOPM assertion - prevents system sleep)
 	sleepRelease  func()
 	sleepMu       sync.Mutex
+	
+	// App Nap prevention (NSProcessInfo activity - prevents process throttling)
+	appNapRelease func()
+	appNapMu      sync.Mutex
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
@@ -153,6 +158,11 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 			if _, err := os.ReadDir(fs.mountpoint); err == nil {
 				log.Printf("[fs] Filesystem is ready and responding to operations")
 				fs.mounted = true
+				
+				// Enable App Nap prevention now that filesystem is mounted
+				// This prevents macOS from throttling the process when it loses focus
+				fs.enableAppNapPrevention()
+				
 				return nil
 			}
 		}
@@ -234,6 +244,14 @@ func (fs *fuseFS) Stop() error {
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("Stop: Error evicting staged files: %v", err)
 	}
+	
+	// Release App Nap prevention if active
+	fs.appNapMu.Lock()
+	if fs.appNapRelease != nil {
+		fs.appNapRelease()
+		fs.appNapRelease = nil
+	}
+	fs.appNapMu.Unlock()
 	
 	// Release sleep prevention if active
 	fs.sleepMu.Lock()
@@ -840,4 +858,40 @@ func (fs *fuseFS) disableSleepPrevention() {
 		fs.sleepRelease()
 		fs.sleepRelease = nil
 	}
+}
+
+// enableAppNapPrevention enables App Nap prevention while the filesystem is mounted.
+// This prevents macOS from throttling the process when it loses focus (App Nap).
+// App Nap is separate from system sleep and can cause FUSE operations to stall.
+func (fs *fuseFS) enableAppNapPrevention() {
+	fs.appNapMu.Lock()
+	defer fs.appNapMu.Unlock()
+	
+	// Only enable if not already enabled
+	if fs.appNapRelease != nil {
+		return
+	}
+	
+	release, err := appnap.PreventAppNap("Active FUSE filesystem")
+	if err != nil {
+		log.Printf("[fs] Warning: failed to enable App Nap prevention: %v", err)
+		return
+	}
+	
+	fs.appNapRelease = release
+	log.Printf("[fs] App Nap prevention enabled (filesystem mounted)")
+}
+
+// disableAppNapPrevention disables App Nap prevention when the filesystem is unmounted.
+func (fs *fuseFS) disableAppNapPrevention() {
+	fs.appNapMu.Lock()
+	defer fs.appNapMu.Unlock()
+	
+	if fs.appNapRelease == nil {
+		return
+	}
+	
+	fs.appNapRelease()
+	fs.appNapRelease = nil
+	log.Printf("[fs] App Nap prevention disabled (filesystem unmounted)")
 }

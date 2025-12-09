@@ -1,6 +1,9 @@
 /bin/
 /dist/
 /build/
+# Allow build/darwin/Info.plist (required for Wails builds)
+!/build/darwin/
+!/build/darwin/Info.plist
 /vendor/
 *.log
 .DS_Store

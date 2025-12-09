@@ -6,9 +6,12 @@ Drag-to-upload for large videos without pre-downloading: a read-only virtual fil
 
 **M3 is macOS-only** with production-ready features:
 - **macOS 15.4+** with **macFUSE FSKit backend** (no kext)
-- Robust Cocoa drag-and-drop (idempotent, validated)
+- Robust Cocoa drag-and-drop (idempotent, validated, native NSEvent-based)
 - Automatic mount recovery (stale mount detection and cleanup)
-- Sleep prevention during active transfers (IOPMAssertion)
+- **App Nap prevention** - prevents process throttling when app loses focus (critical for Finder-launch)
+- **Sleep prevention** during active transfers (IOPMAssertion - prevents system sleep)
+- **Persistent file logging** to ~/Library/Logs/FuseStream/fusestream.log (diagnosable without console)
+- **Lifecycle monitoring** - tracks foreground/background transitions and tests FS responsiveness
 - Dual-ref eviction system (tileRef + openRef)
 - Self-hosted macOS CI build
 
@@ -120,6 +123,67 @@ Environment variable overrides (take precedence):
 - Best for: memory-constrained environments, testing
 
 For most users, the default `temp-file` mode is recommended.
+
+---
+
+## macOS App Nap Prevention & Process Throttling
+
+**Critical for Finder-launched apps:** When the app is launched from Finder (without a console) and loses focus, macOS may throttle the process via **App Nap**, causing FUSE filesystem operations to stall. This manifests as:
+- Uploads freezing when switching to the browser
+- `ls /Volumes/FuseStream` hanging until the app window is closed
+- The app becoming unresponsive when in the background
+
+### Prevention Strategy (Implemented)
+
+The app uses a **dual-layer approach** to prevent process throttling:
+
+1. **Runtime App Nap Prevention (Primary)**
+   - Uses `NSProcessInfo beginActivityWithOptions:` with flags:
+     - `NSActivityUserInitiated` - User-initiated activity (prevents App Nap)
+     - `NSActivityLatencyCritical` - Highest priority, latency-critical
+     - `NSActivityIdleSystemSleepDisabled` - Also prevents idle system sleep
+   - Token is acquired when filesystem mounts, released on unmount
+   - Located in `internal/appnap/` package
+
+2. **Info.plist Backstop (Secondary)**
+   - `NSAppSleepDisabled` key set to `true` in `build/darwin/Info.plist`
+   - Provides additional insurance against process throttling
+   - Applied at app bundle level by Wails build
+
+3. **System Sleep Prevention (During Transfers)**
+   - Uses `IOPMAssertion` (IOKit Power Management) during active file transfers
+   - Prevents full system sleep while file handles are open
+   - Located in `internal/sleep/` package
+   - Note: IOPMAssertion prevents **system sleep** but NOT **App Nap** throttling
+
+### Thread Safety
+
+All FUSE operations are **background-thread safe**:
+- The FUSE mount runs in a dedicated goroutine (not main thread)
+- All FUSE callbacks (Getattr, Readdir, Open, Read, etc.) execute on the mount goroutine
+- No synchronous main thread calls from FUSE code paths
+- Logging and error handling are async and non-blocking
+
+### Lifecycle Monitoring
+
+The app observes NSApplication lifecycle events:
+- `NSApplicationDidBecomeActiveNotification` - app enters foreground
+- `NSApplicationDidResignActiveNotification` - app enters background
+- After losing focus, filesystem responsiveness is tested to detect latent deadlocks
+- All lifecycle events are logged to the persistent log file
+
+### Diagnostic Logging
+
+**Log location:** `~/Library/Logs/FuseStream/fusestream.log`
+
+Key log entries to look for:
+- `[appnap] App Nap prevention enabled` - Runtime prevention is active
+- `[sleep] Sleep prevention enabled` - System sleep prevention active during transfers
+- `[lifecycle] App resigned active (background)` - App lost focus
+- `[lifecycle] FS responsive after resign active` - Filesystem still working in background
+- `[lifecycle] WARNING: FS unresponsive` - Filesystem stalled (indicates throttling issue)
+
+Logs are automatically rotated (max 10MB per file, 5 files kept).
 
 ---
 
@@ -241,9 +305,15 @@ The GUI app mounts at `/Volumes/FuseStream` and opens a window:
 - Try restarting the app (mount recovery will handle stale mounts)
 
 **Sleep prevention not working:**
-- Check logs for `[sleep] Sleep prevention enabled`
-- Verify IOKit framework is available
+- Check logs for `[sleep] Sleep prevention enabled` and `[appnap] App Nap prevention enabled`
+- Verify IOKit and Foundation frameworks are available
 - macOS may override sleep prevention for low battery or scheduled sleep
+
+**App becomes unresponsive when launched from Finder:**
+- Check `~/Library/Logs/FuseStream/fusestream.log` for diagnostic logs
+- Look for `[lifecycle]` entries showing foreground/background transitions
+- Verify App Nap prevention is enabled: `[appnap] App Nap prevention enabled`
+- If filesystem becomes unresponsive after losing focus, check logs for `[lifecycle] WARNING: FS unresponsive`
 
 ### Testing
 
