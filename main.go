@@ -16,6 +16,7 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/dialog"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/lifecycle"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
@@ -101,7 +102,24 @@ func main() {
 			Assets: frontend.Assets,
 		},
 		OnStartup: app.Startup,
+		OnBeforeClose: func(ctx context.Context) bool {
+			// Check if there are active uploads
+			if app.HasActiveUploads() {
+				log.Println("[main] Active uploads detected - asking user for confirmation")
+				// Show confirmation dialog and return user's choice
+				if dialog.ConfirmQuit() {
+					log.Println("[main] User confirmed quit - proceeding with shutdown")
+					return true // User wants to quit
+				}
+				log.Println("[main] User cancelled quit - keeping window open")
+				return false // User wants to cancel - keep window open
+			}
+			// No active uploads - allow close immediately
+			log.Println("[main] No active uploads - allowing window close")
+			return true
+		},
 		OnShutdown: func(ctx context.Context) {
+			log.Println("[main] Shutting down application")
 			cancel() // Trigger daemon shutdown
 		},
 		Bind: []interface{}{

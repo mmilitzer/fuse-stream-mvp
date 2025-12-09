@@ -54,6 +54,10 @@ type FS interface {
 	// EvictAllStagedFiles closes and removes all staged files' BackingStores.
 	// This should be called on app shutdown or when clearing all staged files.
 	EvictAllStagedFiles() error
+	
+	// HasActiveUploads returns true if any staged files have active open file handles.
+	// This indicates uploads are in progress.
+	HasActiveUploads() bool
 }
 
 // New creates a new FS instance (FUSE or stub based on build tags)

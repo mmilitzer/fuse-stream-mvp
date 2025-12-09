@@ -240,3 +240,14 @@ func (a *App) EvictAllStagedFiles() error {
 	}
 	return filesystem.EvictAllStagedFiles()
 }
+
+// HasActiveUploads returns true if there are active file handles open (uploads in progress).
+// The frontend should call this before allowing window close and show a confirmation dialog
+// if uploads are active.
+func (a *App) HasActiveUploads() bool {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return false
+	}
+	return filesystem.HasActiveUploads()
+}

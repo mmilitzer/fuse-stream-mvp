@@ -279,6 +279,20 @@ func (fs *fuseFS) Mounted() bool {
 	return fs.mounted
 }
 
+// HasActiveUploads returns true if any staged files have active open file handles (openRef > 0).
+// This indicates uploads are in progress and the app should not be closed without confirmation.
+func (fs *fuseFS) HasActiveUploads() bool {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	
+	for _, sf := range fs.stagedFiles {
+		if atomic.LoadInt32(&sf.openRef) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
