@@ -59,10 +59,7 @@ func Start(ctx context.Context, mountpoint string, client *api.Client, cfg *conf
 		<-daemonCtx.Done()
 		log.Println("[daemon] Shutting down...")
 		
-		// Stop the filesystem (evict files, release sleep, unmount, then release app nap)
-		// This must be done in order: App Nap must stay active during unmount or it fails.
-		// We do this in a goroutine so we don't block the main thread, but we wait for
-		// unmount to complete so the FUSE mount goroutine can finish properly.
+		// Stop the filesystem (this unmounts and releases resources)
 		if err := filesystem.Stop(); err != nil {
 			log.Printf("[daemon] Error during shutdown: %v", err)
 		}

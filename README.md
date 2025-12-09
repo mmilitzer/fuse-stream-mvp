@@ -96,6 +96,10 @@ mountpoint = "/Volumes/FuseStream"   # macOS default; e.g. "/mnt/fusestream" on 
 fetch_mode = "temp-file"   # default: downloads entire file to temp dir (reliable, recommended)
                            # experimental: "range-lru" (streams chunks on-demand, memory-based cache)
 temp_dir = "/tmp"          # temp file directory (only used in temp-file mode)
+
+# macOS system integration (optional):
+enable_app_nap = false     # Prevent App Nap when filesystem is mounted (default: false)
+                           # Enable if you experience performance issues when app loses focus
 ```
 
 Environment variable overrides (take precedence):
@@ -105,6 +109,7 @@ Environment variable overrides (take precedence):
 - `FSMVP_MOUNTPOINT`
 - `FSMVP_FETCH_MODE` (`temp-file` or `range-lru`)
 - `FSMVP_TEMP_DIR`
+- `FSMVP_ENABLE_APP_NAP` (`true`, `1`, or `yes` to enable)
 
 > The short‑lived **OAuth token is cached in memory only**.
 

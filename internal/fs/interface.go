@@ -32,10 +32,6 @@ type FS interface {
 	// Stop unmounts the filesystem or cleans up stub
 	Stop() error
 	
-	// ReleaseResources releases system resources without unmounting
-	// Used during app shutdown to prevent deadlocks
-	ReleaseResources()
-	
 	// Mountpoint returns the configured mount path
 	Mountpoint() string
 	

@@ -36,10 +36,6 @@ func (fs *stubFS) Stop() error {
 	return nil
 }
 
-func (fs *stubFS) ReleaseResources() {
-	// No-op for stub
-}
-
 func (fs *stubFS) Mountpoint() string {
 	return fs.mountpoint
 }
