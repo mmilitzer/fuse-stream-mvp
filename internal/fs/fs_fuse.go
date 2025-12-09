@@ -263,12 +263,46 @@ func (fs *fuseFS) Stop() error {
 	
 	fs.cancel()
 	if fs.host != nil {
+		log.Println("[fs] Unmounting filesystem...")
 		if !fs.host.Unmount() {
+			log.Println("[fs] Normal unmount failed")
 			return fmt.Errorf("failed to unmount filesystem")
 		}
+		log.Println("[fs] Filesystem unmounted successfully")
 	}
 	fs.mounted = false
 	return nil
+}
+
+// StopAsync attempts to unmount the filesystem asynchronously and returns immediately.
+// The caller should wait for the returned channel to signal completion.
+func (fs *fuseFS) StopAsync() <-chan error {
+	errChan := make(chan error, 1)
+	
+	go func() {
+		errChan <- fs.Stop()
+	}()
+	
+	return errChan
+}
+
+// ForceUnmount attempts to forcibly unmount the filesystem using OS-specific commands.
+// This should only be called if normal unmount fails or times out.
+func (fs *fuseFS) ForceUnmount() error {
+	if runtime.GOOS == "darwin" {
+		log.Printf("[fs] Attempting force unmount at %s", fs.mountpoint)
+		cmd := fmt.Sprintf("diskutil unmount force '%s' 2>&1 || umount -f '%s' 2>&1", fs.mountpoint, fs.mountpoint)
+		output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+		if err != nil {
+			log.Printf("[fs] Force unmount failed: %v, output: %s", err, string(output))
+			return fmt.Errorf("force unmount failed: %w", err)
+		}
+		log.Printf("[fs] Force unmount successful: %s", string(output))
+		fs.mounted = false
+		return nil
+	}
+	
+	return fmt.Errorf("force unmount not implemented for %s", runtime.GOOS)
 }
 
 func (fs *fuseFS) Mountpoint() string {

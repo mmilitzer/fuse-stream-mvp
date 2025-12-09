@@ -3,10 +3,16 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/drag"
+)
+
+var (
+	appInstance *App
+	appMu       sync.Mutex
 )
 
 type App struct {
@@ -15,9 +21,20 @@ type App struct {
 }
 
 func NewApp(client *api.Client) *App {
-	return &App{
+	appMu.Lock()
+	defer appMu.Unlock()
+	
+	appInstance = &App{
 		client: client,
 	}
+	return appInstance
+}
+
+// GetAppInstance returns the global app instance (used by app delegate)
+func GetAppInstance() *App {
+	appMu.Lock()
+	defer appMu.Unlock()
+	return appInstance
 }
 
 func (a *App) Startup(ctx context.Context) {

@@ -97,6 +97,19 @@ func Shutdown() {
 	}
 }
 
+// UnmountFS attempts to unmount the filesystem and returns an error if it fails.
+// This is used by the app delegate to cleanly unmount before termination.
+func UnmountFS() error {
+	mu.Lock()
+	defer mu.Unlock()
+	
+	if instance == nil || instance.fs == nil {
+		return nil // Nothing to unmount
+	}
+	
+	return instance.fs.Stop()
+}
+
 func KeepAlive(ctx context.Context) {
 	log.Println("[daemon] Running in headless mode. Press Ctrl+C to exit.")
 	<-ctx.Done()

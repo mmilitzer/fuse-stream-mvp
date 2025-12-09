@@ -6,8 +6,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -15,10 +13,11 @@ import (
 
 	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/appdelegate"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
-	"github.com/mmilitzer/fuse-stream-mvp/internal/dialog"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/lifecycle"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/signals"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/mmilitzer/fuse-stream-mvp/ui"
 )
@@ -47,19 +46,36 @@ func main() {
 	// Create API client
 	client := api.NewClient(cfg.APIBase, cfg.ClientID, cfg.ClientSecret)
 
-	// Handle OS signals for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("Received shutdown signal")
+	// Setup signal handler for graceful shutdown
+	// On macOS, SIGTERM will trigger NSApp terminate (proper termination flow)
+	// SIGINT (Ctrl+C) will cancel the context
+	signals.SetupSignalHandler(func() {
+		log.Println("[main] Received shutdown signal")
 		cancel()
-	}()
+	})
 
 	// Start daemon services (FUSE mount) in background
 	if err := daemon.Start(ctx, cfg.Mountpoint, client, cfg); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
+
+	// Install macOS app delegate for proper termination handling
+	// This handles Cmd+Q, Quit menu, and window close events properly
+	appdelegate.Install(
+		func() bool {
+			// Check if there are active uploads
+			app := ui.GetAppInstance()
+			if app == nil {
+				return false
+			}
+			return app.HasActiveUploads()
+		},
+		func() error {
+			// Unmount filesystem before termination
+			log.Println("[main] App delegate requested unmount")
+			return daemon.UnmountFS()
+		},
+	)
 
 	// Set up lifecycle observer for foreground/background events
 	cleanupLifecycle, err := lifecycle.ObserveActivation(func(active bool) {
@@ -102,22 +118,8 @@ func main() {
 			Assets: frontend.Assets,
 		},
 		OnStartup: app.Startup,
-		OnBeforeClose: func(ctx context.Context) bool {
-			// Check if there are active uploads
-			if app.HasActiveUploads() {
-				log.Println("[main] Active uploads detected - asking user for confirmation")
-				// Show confirmation dialog and return user's choice
-				if dialog.ConfirmQuit() {
-					log.Println("[main] User confirmed quit - proceeding with shutdown")
-					return true // User wants to quit
-				}
-				log.Println("[main] User cancelled quit - keeping window open")
-				return false // User wants to cancel - keep window open
-			}
-			// No active uploads - allow close immediately
-			log.Println("[main] No active uploads - allowing window close")
-			return true
-		},
+		// OnBeforeClose: removed - macOS app delegate now handles termination properly
+		// This prevents the deadlock caused by dispatch_sync on the main thread
 		OnShutdown: func(ctx context.Context) {
 			log.Println("[main] Shutting down application")
 			cancel() // Trigger daemon shutdown

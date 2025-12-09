@@ -32,7 +32,9 @@ int FSMVP_BeginActivity(const char *reasonCStr) {
         
         // NSActivityUserInitiated: User initiated activity (prevents App Nap)
         // NSActivityLatencyCritical: Latency-critical activity (highest priority)
-        // NSActivityIdleSystemSleepDisabled: Also prevents idle system sleep
+        // NSActivityIdleSystemSleepDisabled: Prevents idle system sleep
+        // NOTE: We explicitly DO NOT use NSActivitySuddenTerminationDisabled or
+        // NSActivityAutomaticTerminationDisabled as these prevent proper app termination
         NSActivityOptions options = NSActivityUserInitiated | 
                                      NSActivityLatencyCritical |
                                      NSActivityIdleSystemSleepDisabled;
