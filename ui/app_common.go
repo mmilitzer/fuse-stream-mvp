@@ -3,9 +3,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/appdelegate"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/drag"
 )
@@ -39,6 +41,21 @@ func GetAppInstance() *App {
 
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
+	
+	// Install macOS app delegate for proper termination handling
+	// Must be done after Wails initializes NSApplication
+	appdelegate.Install(
+		func() bool {
+			// Check if there are active uploads
+			return a.HasActiveUploads()
+		},
+		func() error {
+			// Unmount filesystem before termination
+			log.Println("[appdelegate] Unmount requested")
+			return daemon.UnmountFS()
+		},
+	)
+	log.Println("[main] App delegate installed in OnStartup")
 }
 
 type JobInfo struct {

@@ -13,7 +13,6 @@ import (
 
 	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
-	"github.com/mmilitzer/fuse-stream-mvp/internal/appdelegate"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/lifecycle"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
@@ -58,24 +57,6 @@ func main() {
 	if err := daemon.Start(ctx, cfg.Mountpoint, client, cfg); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
-
-	// Install macOS app delegate for proper termination handling
-	// This handles Cmd+Q, Quit menu, and window close events properly
-	appdelegate.Install(
-		func() bool {
-			// Check if there are active uploads
-			app := ui.GetAppInstance()
-			if app == nil {
-				return false
-			}
-			return app.HasActiveUploads()
-		},
-		func() error {
-			// Unmount filesystem before termination
-			log.Println("[main] App delegate requested unmount")
-			return daemon.UnmountFS()
-		},
-	)
 
 	// Set up lifecycle observer for foreground/background events
 	cleanupLifecycle, err := lifecycle.ObserveActivation(func(active bool) {
