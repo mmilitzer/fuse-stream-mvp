@@ -85,7 +85,8 @@ func (c *Client) ListJobsWithOptions(opts ListJobsOptions) (*JobsResponse, error
 	}
 
 	// Build URL with query parameters
-	reqURL := fmt.Sprintf("%s/jobs/?status=SUCCESS&expand=file&start=%d&limit=%d&sort=%s&direction=%s",
+	// IMPORTANT: autograph=true ensures we only fetch jobs that support autograph_tag personalization
+	reqURL := fmt.Sprintf("%s/jobs/?status=SUCCESS&expand=file&autograph=true&start=%d&limit=%d&sort=%s&direction=%s",
 		c.apiBase, opts.Start, opts.Limit, opts.Sort, opts.Direction)
 	
 	if opts.NameFilter != "" {

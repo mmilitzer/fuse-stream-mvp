@@ -93,6 +93,12 @@
             background: #ccc;
             cursor: not-allowed;
         }
+        .drag-tile.dragging {
+            opacity: 0.6;
+            transform: scale(0.95);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            transition: all 0.1s ease;
+        }
         .drag-tile[title]:after {
             content: '';
             position: absolute;
@@ -458,12 +464,20 @@
                 
                 if (!stagedFilePath) return;
                 
+                // Add visual feedback
+                dragTile.classList.add('dragging');
+                
                 // Call Go backend immediately - do NOT await any async UI work
                 // Cocoa needs the current mouse event to start the drag
                 window.go.ui.App.StartNativeDrag(stagedFilePath)
+                    .then(() => {
+                        // Remove dragging class after drag completes
+                        dragTile.classList.remove('dragging');
+                    })
                     .catch(err => {
                         // Log errors but don't block - drag might still work
                         console.error('Native drag error:', err);
+                        dragTile.classList.remove('dragging');
                     });
             });
         }

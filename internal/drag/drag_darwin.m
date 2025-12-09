@@ -91,11 +91,18 @@ int FSMVP_StartFileDrag(const char *cpath) {
       // Create dragging item
       NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:writer];
       
-      // Set dragging frame centered at cursor location
-      NSRect dragRect = NSMakeRect(locInView.x - 16, locInView.y - 16, 32, 32);
-      [item setDraggingFrame:dragRect contents:nil]; // nil = use default icon
+      // Build a drag preview image using NSWorkspace
+      NSImage *img = [[NSWorkspace sharedWorkspace] iconForFile:path];
+      if (!img) {
+        // Fallback to generic document icon if iconForFile fails
+        img = [[NSWorkspace sharedWorkspace] iconForFileType:NSFileTypeForHFSTypeCode(kGenericDocumentIcon)];
+      }
       
-      NSLog(@"[drag] Created dragging item with frame: (%.1f, %.1f, %.1f, %.1f)",
+      // Set dragging frame centered at cursor location
+      NSRect dragRect = NSMakeRect(locInView.x - 32, locInView.y - 32, 64, 64);
+      [item setDraggingFrame:dragRect contents:img];
+      
+      NSLog(@"[drag] Created dragging item with frame: (%.1f, %.1f, %.1f, %.1f) and preview image",
             dragRect.origin.x, dragRect.origin.y, dragRect.size.width, dragRect.size.height);
 
       // Create drag source
