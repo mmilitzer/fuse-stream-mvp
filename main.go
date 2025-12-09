@@ -6,6 +6,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -122,12 +123,15 @@ func main() {
 				cleanupLifecycle()
 			}
 			
-			cancel() // Trigger daemon shutdown
+			// Trigger daemon shutdown - the daemon's goroutine will handle
+			// unmounting asynchronously. We don't wait for it to complete here
+			// because OnShutdown might be running on the main thread, and calling
+			// fs.host.Unmount() synchronously from the main thread can deadlock
+			// with the FUSE event loop.
+			cancel()
 			
-			// Unmount filesystem
-			if err := daemon.UnmountFS(); err != nil {
-				log.Printf("[main] Warning: failed to unmount: %v", err)
-			}
+			// Give the daemon a moment to start unmounting before the app exits
+			time.Sleep(100 * time.Millisecond)
 		},
 		Bind: []interface{}{
 			app,
