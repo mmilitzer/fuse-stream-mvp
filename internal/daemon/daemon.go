@@ -59,12 +59,10 @@ func Start(ctx context.Context, mountpoint string, client *api.Client, cfg *conf
 		<-daemonCtx.Done()
 		log.Println("[daemon] Shutting down...")
 		
-		// Give time for active operations to complete
-		time.Sleep(100 * time.Millisecond)
-		
-		if err := filesystem.Stop(); err != nil {
-			log.Printf("[daemon] Error stopping filesystem: %v", err)
-		}
+		// Release resources but don't try to unmount - unmounting from a
+		// goroutine while the main thread is exiting can deadlock with cgofuse.
+		// The OS will automatically clean up the FUSE mount when the process exits.
+		filesystem.ReleaseResources()
 		
 		log.Println("[daemon] Shutdown complete")
 	}()

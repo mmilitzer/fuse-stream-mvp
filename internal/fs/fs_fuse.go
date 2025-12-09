@@ -239,10 +239,14 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 	return nil
 }
 
-func (fs *fuseFS) Stop() error {
+// ReleaseResources releases system resources (app nap, sleep prevention, etc.)
+// without attempting to unmount the filesystem. This is used during app shutdown
+// to prevent deadlocks - the OS will automatically clean up the FUSE mount when
+// the process exits.
+func (fs *fuseFS) ReleaseResources() {
 	// Evict all staged files to clean up BackingStores
 	if err := fs.EvictAllStagedFiles(); err != nil {
-		log.Printf("Stop: Error evicting staged files: %v", err)
+		log.Printf("[fs] Error evicting staged files: %v", err)
 	}
 	
 	// Release App Nap prevention if active
@@ -261,7 +265,17 @@ func (fs *fuseFS) Stop() error {
 	}
 	fs.sleepMu.Unlock()
 	
+	// Cancel context to signal any ongoing operations to stop
 	fs.cancel()
+	
+	log.Println("[fs] Resources released, OS will clean up mount on process exit")
+}
+
+func (fs *fuseFS) Stop() error {
+	// Release resources first
+	fs.ReleaseResources()
+	
+	// Now attempt unmount
 	if fs.host != nil {
 		log.Println("[fs] Unmounting filesystem...")
 		if !fs.host.Unmount() {
