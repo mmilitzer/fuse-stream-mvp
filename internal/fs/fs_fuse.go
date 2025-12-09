@@ -243,11 +243,9 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 	return nil
 }
 
-// ReleaseResources releases system resources (app nap, sleep prevention, etc.)
-// without attempting to unmount the filesystem. This is used during app shutdown
-// to prevent deadlocks - the OS will automatically clean up the FUSE mount when
-// the process exits.
-func (fs *fuseFS) ReleaseResources() {
+// releaseResourcesExceptAppNap releases system resources except App Nap prevention.
+// This is called before unmount - App Nap must stay active during unmount or it fails.
+func (fs *fuseFS) releaseResourcesExceptAppNap() {
 	fs.resourcesMu.Lock()
 	defer fs.resourcesMu.Unlock()
 	
@@ -261,14 +259,6 @@ func (fs *fuseFS) ReleaseResources() {
 		log.Printf("[fs] Error evicting staged files: %v", err)
 	}
 	
-	// Release App Nap prevention if active
-	fs.appNapMu.Lock()
-	if fs.appNapRelease != nil {
-		fs.appNapRelease()
-		fs.appNapRelease = nil
-	}
-	fs.appNapMu.Unlock()
-	
 	// Release sleep prevention if active
 	fs.sleepMu.Lock()
 	if fs.sleepRelease != nil {
@@ -280,15 +270,44 @@ func (fs *fuseFS) ReleaseResources() {
 	// Cancel context to signal any ongoing operations to stop
 	fs.cancel()
 	
-	log.Println("[fs] Resources released")
+	log.Println("[fs] Resources released (except App Nap)")
+}
+
+// releaseAppNap releases App Nap prevention. Must be called after unmount completes.
+func (fs *fuseFS) releaseAppNap() {
+	fs.appNapMu.Lock()
+	defer fs.appNapMu.Unlock()
+	
+	if fs.appNapRelease != nil {
+		fs.appNapRelease()
+		fs.appNapRelease = nil
+		log.Println("[fs] App Nap prevention released")
+	}
+}
+
+// ReleaseResources releases all system resources including App Nap.
+// This is used during app shutdown when unmount is not possible or needed.
+func (fs *fuseFS) ReleaseResources() {
+	fs.releaseResourcesExceptAppNap()
+	fs.releaseAppNap()
 }
 
 func (fs *fuseFS) Stop() error {
-	fs.ReleaseResources()
-	return fs.Unmount()
+	// Evict files and release sleep prevention, but keep App Nap active
+	// until after unmount completes (releasing App Nap before unmount
+	// causes unmount to fail due to process throttling)
+	fs.releaseResourcesExceptAppNap()
+	
+	// Unmount the filesystem
+	err := fs.Unmount()
+	
+	// Now it's safe to release App Nap
+	fs.releaseAppNap()
+	
+	return err
 }
 
-// Unmount attempts to unmount the FUSE filesystem without releasing resources
+// Unmount attempts to unmount the FUSE filesystem
 func (fs *fuseFS) Unmount() error {
 	if fs.host != nil {
 		log.Println("[fs] Unmounting filesystem...")
