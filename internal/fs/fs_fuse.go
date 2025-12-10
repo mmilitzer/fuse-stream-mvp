@@ -373,14 +373,18 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 
 	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
 	
-	// MVP limitation: only one staged file at a time
-	// Clear tileRef for all previous staged files (but don't close if they have active uploads)
-	for existingID, sff := range fs.stagedFiles {
-		log.Printf("StageFile: Clearing tileRef for previous staged file %s", existingID)
-		atomic.StoreInt32(&sff.tileRef, 0)
-		// Try to evict immediately if no active FUSE handles
-		fs.tryEvictLocked(existingID)
+	// Check if this file is already staged
+	if existingSff, exists := fs.stagedFiles[id]; exists {
+		// File already staged - just update it and reset tileRef to 1
+		log.Printf("StageFile: File %s already staged, resetting tileRef=1", id)
+		atomic.StoreInt32(&existingSff.tileRef, 1)
+		existingSff.ModTime = time.Now()
+		return existingSff.StagedFile, nil
 	}
+	
+	// Allow multiple staged files - TempFileManager will handle the 10-file limit
+	// through LRU eviction when disk space is needed
+	log.Printf("StageFile: Staging new file %s (current staged files: %d)", fileName, len(fs.stagedFiles))
 	
 	sf := &StagedFile{
 		ID:           id,
@@ -399,7 +403,8 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 		openRef:    0, // No FUSE handles yet
 	}
 	fs.stagedFiles[id] = sff
-	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s, tileRef=1, openRef=0)", fileName, fileID, recipientTag)
+	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s, tileRef=1, openRef=0, total staged=%d)", 
+		fileName, fileID, recipientTag, len(fs.stagedFiles))
 	return sf, nil
 }
 
