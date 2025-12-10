@@ -141,25 +141,37 @@ func (m *TempFileManager) GetDiskUsage() (total uint64, available uint64, err er
 
 // CheckSpaceAvailable checks if there's enough space for a file of the given size
 // Returns true if space is available, false otherwise
+// This checks two conditions:
+// 1. We have enough available disk space for the file
+// 2. Our temp files won't exceed 70% of total disk capacity
 func (m *TempFileManager) CheckSpaceAvailable(fileSize int64) (bool, error) {
 	total, available, err := m.GetDiskUsage()
 	if err != nil {
 		return false, err
 	}
 	
-	// Calculate how much space we're allowed to use (70% of total)
-	maxAllowed := uint64(float64(total) * (float64(MaxDiskUsagePercent) / 100.0))
+	// Calculate how much space OUR temp files are allowed to use (70% of total)
+	maxAllowedForTempFiles := uint64(float64(total) * (float64(MaxDiskUsagePercent) / 100.0))
 	
-	// Calculate current usage
-	used := total - available
+	// Calculate how much space OUR temp files currently use
+	m.mu.Lock()
+	var ourTempFileUsage uint64
+	for _, info := range m.files {
+		ourTempFileUsage += uint64(info.Size)
+	}
+	m.mu.Unlock()
 	
-	// Check if adding this file would exceed our limit
-	newUsed := used + uint64(fileSize)
+	// Check if adding this file would make OUR temp files exceed 70% of disk
+	newTempFileUsage := ourTempFileUsage + uint64(fileSize)
 	
-	log.Printf("[tempfile] Disk usage check: total=%d MB, available=%d MB, used=%d MB, maxAllowed=%d MB, fileSize=%d MB, newUsed=%d MB",
-		total/(1024*1024), available/(1024*1024), used/(1024*1024), maxAllowed/(1024*1024), fileSize/(1024*1024), newUsed/(1024*1024))
+	// Also check if we have enough available space on disk
+	hasEnoughAvailable := uint64(fileSize) <= available
+	tempFilesUnderLimit := newTempFileUsage <= maxAllowedForTempFiles
 	
-	return newUsed <= maxAllowed, nil
+	log.Printf("[tempfile] Disk usage check: total=%d MB, available=%d MB, ourTempFiles=%d MB, maxAllowedForTempFiles=%d MB, fileSize=%d MB, newTempFileUsage=%d MB",
+		total/(1024*1024), available/(1024*1024), ourTempFileUsage/(1024*1024), maxAllowedForTempFiles/(1024*1024), fileSize/(1024*1024), newTempFileUsage/(1024*1024))
+	
+	return hasEnoughAvailable && tempFilesUnderLimit, nil
 }
 
 // EnsureSpaceAvailable ensures there's enough space for a file of the given size
