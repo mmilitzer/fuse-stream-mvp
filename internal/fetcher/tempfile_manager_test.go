@@ -195,3 +195,99 @@ func TestMaxTempFiles(t *testing.T) {
 		t.Errorf("Expected fewer than %d files after eviction, got %d", MaxTempFiles, manager.GetFileCount())
 	}
 }
+
+func TestCleanupAllFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "fsmvp-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	manager := &TempFileManager{
+		tempDir: tempDir,
+		files:   make(map[string]*TempFileInfo),
+	}
+
+	// Create and register several temp files
+	testFiles := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		path := filepath.Join(tempDir, "fsmvp-cleanup-test-"+string(rune('a'+i))+".tmp")
+		testFiles[i] = path
+		
+		// Create actual files
+		if err := os.WriteFile(path, []byte("test data for cleanup"), 0600); err != nil {
+			t.Fatalf("Failed to create test file %s: %v", path, err)
+		}
+		
+		// Register with manager
+		manager.Register(path, int64(100), nil)
+	}
+
+	// Verify files are registered
+	if manager.GetFileCount() != 5 {
+		t.Errorf("Expected 5 files registered, got %d", manager.GetFileCount())
+	}
+
+	// Verify files exist on disk
+	for _, path := range testFiles {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("Test file %s should exist before cleanup", path)
+		}
+	}
+
+	// Call CleanupAllFiles
+	if err := manager.CleanupAllFiles(); err != nil {
+		t.Errorf("CleanupAllFiles failed: %v", err)
+	}
+
+	// Verify all files were deleted from disk
+	for _, path := range testFiles {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("File %s should be deleted after CleanupAllFiles", path)
+		}
+	}
+
+	// Verify manager's tracking map is cleared
+	if manager.GetFileCount() != 0 {
+		t.Errorf("Expected 0 files after CleanupAllFiles, got %d", manager.GetFileCount())
+	}
+}
+
+func TestCleanupAllFiles_WithNonExistentFile(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "fsmvp-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	manager := &TempFileManager{
+		tempDir: tempDir,
+		files:   make(map[string]*TempFileInfo),
+	}
+
+	// Register a file that doesn't actually exist on disk
+	nonExistentPath := filepath.Join(tempDir, "fsmvp-nonexistent.tmp")
+	manager.Register(nonExistentPath, int64(100), nil)
+
+	// Create another file that does exist
+	existingPath := filepath.Join(tempDir, "fsmvp-existing.tmp")
+	if err := os.WriteFile(existingPath, []byte("test data"), 0600); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+	manager.Register(existingPath, int64(100), nil)
+
+	// CleanupAllFiles should handle the non-existent file gracefully
+	if err := manager.CleanupAllFiles(); err != nil {
+		t.Errorf("CleanupAllFiles should not fail when a file doesn't exist: %v", err)
+	}
+
+	// Verify the existing file was deleted
+	if _, err := os.Stat(existingPath); !os.IsNotExist(err) {
+		t.Errorf("Existing file should be deleted")
+	}
+
+	// Verify tracking map is cleared
+	if manager.GetFileCount() != 0 {
+		t.Errorf("Expected 0 files after CleanupAllFiles, got %d", manager.GetFileCount())
+	}
+}

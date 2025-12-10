@@ -261,6 +261,18 @@ func (fs *fuseFS) Stop() error {
 		log.Printf("[fs] Error evicting staged files: %v", err)
 	}
 	
+	// Clean up all temp files from TempFileManager
+	// This ensures any temp files that weren't properly closed are removed
+	tempDir := fs.config.TempDir
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	tempManager := fetcher.GetTempFileManager(tempDir)
+	if err := tempManager.CleanupAllFiles(); err != nil {
+		log.Printf("[fs] Warning: error cleaning up temp files: %v", err)
+		// Continue with shutdown even if cleanup fails
+	}
+	
 	// Release App Nap prevention if active
 	fs.appNapMu.Lock()
 	if fs.appNapRelease != nil {

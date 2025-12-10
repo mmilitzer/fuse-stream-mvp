@@ -309,3 +309,37 @@ func (m *TempFileManager) GetFileCount() int {
 	defer m.mu.Unlock()
 	return len(m.files)
 }
+
+// CleanupAllFiles removes all currently tracked temp files.
+// This should be called during application shutdown to ensure all temp files are deleted.
+func (m *TempFileManager) CleanupAllFiles() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if len(m.files) == 0 {
+		log.Printf("[tempfile] No temp files to clean up")
+		return nil
+	}
+	
+	log.Printf("[tempfile] Cleaning up %d temp files on shutdown", len(m.files))
+	
+	var errors []error
+	for path := range m.files {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("[tempfile] Warning: failed to remove temp file %s: %v", path, err)
+			errors = append(errors, err)
+		} else {
+			log.Printf("[tempfile] Removed temp file: %s", path)
+		}
+	}
+	
+	// Clear the tracking map
+	m.files = make(map[string]*TempFileInfo)
+	
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to remove %d temp files", len(errors))
+	}
+	
+	log.Printf("[tempfile] All temp files cleaned up successfully")
+	return nil
+}
