@@ -37,17 +37,28 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		return nil, fmt.Errorf("invalid file size: %d", size)
 	}
 
-	// Create temp file
+	// Get temp directory
 	tempDir := opts.TempDir
 	if tempDir == "" {
 		tempDir = os.TempDir()
 	}
+	
+	// Get temp file manager and ensure space is available
+	manager := GetTempFileManager(tempDir)
+	if err := manager.EnsureSpaceAvailable(size); err != nil {
+		return nil, fmt.Errorf("ensure disk space: %w", err)
+	}
+
+	// Create temp file
 	tempFile, err := os.CreateTemp(tempDir, "fsmvp-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
 	}
 	tempPath := tempFile.Name()
 	tempFile.Close() // We'll reopen for writing in the downloader
+	
+	// Register with manager
+	manager.Register(tempPath, size)
 
 	// Create store
 	ctx, cancel := context.WithCancel(ctx)
@@ -186,6 +197,11 @@ func (s *TempFileStore) Close() error {
 	// Wait for downloader to finish
 	s.wg.Wait()
 
+	// Unregister from manager
+	if manager := globalManager; manager != nil {
+		manager.Unregister(s.tempPath)
+	}
+
 	// Remove temp file
 	return os.Remove(s.tempPath)
 }
@@ -239,6 +255,12 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	defer f.Close()
 
 	n, err := f.ReadAt(p, off)
+	
+	// Update access time in manager
+	if manager := globalManager; manager != nil {
+		manager.UpdateAccess(s.tempPath)
+	}
+	
 	if err != nil {
 		// If we got some data but hit EOF, that's fine
 		if err == io.EOF && n > 0 && off+int64(n) <= s.size {

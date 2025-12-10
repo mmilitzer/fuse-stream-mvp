@@ -86,6 +86,17 @@ func newFS(client *api.Client, cfg *config.Config) FS {
 func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
 	
+	// Clean up stale temp files from previous runs
+	tempDir := fs.config.TempDir
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	tempManager := fetcher.GetTempFileManager(tempDir)
+	if err := tempManager.CleanupStaleFiles(); err != nil {
+		log.Printf("[fs] Warning: failed to cleanup stale temp files: %v", err)
+		// Continue anyway - this is not a fatal error
+	}
+	
 	// Attempt mount recovery on macOS
 	if runtime.GOOS == "darwin" {
 		if err := fs.recoverStaleMountMacOS(); err != nil {
@@ -338,6 +349,25 @@ func (fs *fuseFS) HasActiveUploads() bool {
 }
 
 func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
+	// Check disk space availability BEFORE acquiring lock (to avoid blocking other operations)
+	// Only check for temp-file mode, not range-lru mode
+	if fs.config.FetchMode == "temp-file" {
+		tempDir := fs.config.TempDir
+		if tempDir == "" {
+			tempDir = os.TempDir()
+		}
+		
+		tempManager := fetcher.GetTempFileManager(tempDir)
+		
+		// Try to ensure space is available (will evict old files if needed)
+		if err := tempManager.EnsureSpaceAvailable(size); err != nil {
+			// If we can't free enough space, return a user-friendly error
+			log.Printf("StageFile: Insufficient disk space for %s (%d bytes): %v", fileName, size, err)
+			return nil, fmt.Errorf("insufficient disk space: %w", err)
+		}
+		log.Printf("StageFile: Disk space check passed for %s (%d bytes)", fileName, size)
+	}
+	
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
