@@ -93,3 +93,7 @@ func (fs *stubFS) EvictAllStagedFiles() error {
 	fs.stagedFiles = make(map[string]*StagedFile)
 	return nil
 }
+
+func (fs *stubFS) HasActiveUploads() bool {
+	return false
+}

@@ -10,38 +10,124 @@
 }
 @end
 
-void StartFileDrag(const char *cpath) {
+// FSMVP_StartFileDrag initiates a native Cocoa file drag.
+// Returns: 0 on success, 1 on validation errors, 2 on file not found
+int FSMVP_StartFileDrag(const char *cpath) {
   @autoreleasepool {
+    // Validate path string
+    if (!cpath || strlen(cpath) == 0) {
+      NSLog(@"[drag] Invalid path: null or empty");
+      return 1;
+    }
+    
     NSString *path = [NSString stringWithUTF8String:cpath];
-    NSURL *url = [NSURL fileURLWithPath:path isDirectory:NO];
-
-    NSPasteboardItem *pbItem = [[NSPasteboardItem alloc] init];
-    [pbItem setString:url.absoluteString forType:NSPasteboardTypeFileURL];
-
-    NSDraggingItem *dragItem = [[NSDraggingItem alloc] initWithPasteboardWriter:pbItem];
-    NSRect frame = NSMakeRect(0,0,64,64);
-    [dragItem setDraggingFrame:frame contents:[NSImage imageNamed:NSImageNameMultipleDocuments]];
-
-    NSWindow *win = [NSApp keyWindow];
-    if (!win) return;
-    NSView *view = win.contentView;
-
-    NSEvent *event = [NSApp currentEvent];
-    if (!event) {
-      // Fallback: synthesize a minimal left-mouse event at center of view
-      NSPoint p = NSMakePoint(NSWidth(view.bounds)/2, NSHeight(view.bounds)/2);
-      event = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
-                                 location:[view convertPoint:p toView:nil]
-                            modifierFlags:0
-                                timestamp:NSTimeIntervalSince1970
-                             windowNumber:win.windowNumber
-                                  context:nil
-                              eventNumber:0
-                               clickCount:1
-                                 pressure:1.0];
+    if (!path) {
+      NSLog(@"[drag] Failed to create NSString from path");
+      return 1;
+    }
+    
+    NSLog(@"[drag] Starting drag for path: %@", path);
+    
+    // Verify file exists
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+      NSLog(@"[drag] File does not exist: %@", path);
+      return 2;
     }
 
-    FSMVPDragSource *source = [FSMVPDragSource new];
-    [view beginDraggingSessionWithItems:@[dragItem] event:event source:source];
+    // Define the drag start block
+    dispatch_block_t start = ^{
+      // Get current window and view
+      NSWindow *win = [NSApp keyWindow];
+      if (!win) {
+        win = [NSApp mainWindow];
+      }
+      if (!win) {
+        NSLog(@"[drag] No window available");
+        return;
+      }
+      NSLog(@"[drag] Window found: %@", win);
+      
+      NSView *view = win.contentView;
+      if (!view) {
+        NSLog(@"[drag] No content view available");
+        return;
+      }
+      NSLog(@"[drag] Content view found");
+
+      // Get the current event - must be a mouse event
+      NSEvent *evt = [NSApp currentEvent];
+      if (!evt) {
+        NSLog(@"[drag] No current event");
+        return;
+      }
+      
+      NSEventType evtType = evt.type;
+      NSLog(@"[drag] Current event type: %lu", (unsigned long)evtType);
+      
+      if (evtType != NSEventTypeLeftMouseDown && evtType != NSEventTypeLeftMouseDragged) {
+        NSLog(@"[drag] No valid mouse event (not LeftMouseDown or LeftMouseDragged)");
+        return;
+      }
+
+      // Get mouse location in window and convert to view coordinates
+      NSPoint locInWin = [evt locationInWindow];
+      NSPoint locInView = [view convertPoint:locInWin fromView:nil];
+      NSLog(@"[drag] Mouse location in view: (%.1f, %.1f)", locInView.x, locInView.y);
+
+      // Create NSURL - it acts as an NSPasteboardWriting with type public.file-url
+      NSURL *url = [NSURL fileURLWithPath:path];
+      if (!url) {
+        NSLog(@"[drag] Failed to create NSURL");
+        return;
+      }
+      NSLog(@"[drag] Created URL: %@", url);
+      
+      id<NSPasteboardWriting> writer = (id)url;
+      if (!writer) {
+        NSLog(@"[drag] No pasteboard writer");
+        return;
+      }
+
+      // Create dragging item
+      NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:writer];
+      
+      // Build a drag preview image using NSWorkspace
+      NSImage *img = [[NSWorkspace sharedWorkspace] iconForFile:path];
+      if (!img) {
+        // Fallback to generic document icon if iconForFile fails
+        img = [[NSWorkspace sharedWorkspace] iconForFileType:NSFileTypeForHFSTypeCode(kGenericDocumentIcon)];
+      }
+      
+      // Set dragging frame centered at cursor location
+      NSRect dragRect = NSMakeRect(locInView.x - 32, locInView.y - 32, 64, 64);
+      [item setDraggingFrame:dragRect contents:img];
+      
+      NSLog(@"[drag] Created dragging item with frame: (%.1f, %.1f, %.1f, %.1f) and preview image",
+            dragRect.origin.x, dragRect.origin.y, dragRect.size.width, dragRect.size.height);
+
+      // Create drag source
+      FSMVPDragSource *source = [[FSMVPDragSource alloc] init];
+      
+      // Begin dragging session
+      // This blocks until the drag completes
+      NSLog(@"[drag] Starting dragging session...");
+      NSDraggingSession *session = [view beginDraggingSessionWithItems:@[item]
+                                                                  event:evt
+                                                                 source:source];
+      
+      (void)session; // Acknowledge unused variable - rely on defaults (copy operation)
+      NSLog(@"[drag] Drag session completed");
+    };
+
+    // Ensure we run on the main thread
+    if (![NSThread isMainThread]) {
+      NSLog(@"[drag] Dispatching to main thread");
+      dispatch_sync(dispatch_get_main_queue(), start);
+    } else {
+      NSLog(@"[drag] Already on main thread");
+      start();
+    }
+    
+    return 0;
   }
 }

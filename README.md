@@ -2,10 +2,20 @@
 
 Drag-to-upload for large videos without pre-downloading: a read-only virtual filesystem that streams from **Xvid MediaHub** over HTTP Range while the browser uploads.
 
-This MVP targets:
-- **macOS 15.4+** with **macFUSE FSKit backend** (no kext).
-- **Linux** with FUSE3.
-- (Windows is out-of-scope for Milestones M1–M3.)
+## Current Status: M3 (macOS-only MVP)
+
+**M3 is macOS-only** with production-ready features:
+- **macOS 15.4+** with **macFUSE FSKit backend** (no kext)
+- Robust Cocoa drag-and-drop (idempotent, validated, native NSEvent-based)
+- Automatic mount recovery (stale mount detection and cleanup)
+- **App Nap prevention** - prevents process throttling when app loses focus (critical for Finder-launch)
+- **Sleep prevention** during active transfers (IOPMAssertion - prevents system sleep)
+- **Persistent file logging** to ~/Library/Logs/FuseStream/fusestream.log (diagnosable without console)
+- **Lifecycle monitoring** - tracks foreground/background transitions and tests FS responsiveness
+- Dual-ref eviction system (tileRef + openRef)
+- Self-hosted macOS CI build
+
+Linux support (M1/M2) has been removed in this milestone. Future cross-platform support may be reconsidered post-M3.
 
 ---
 
@@ -86,6 +96,10 @@ mountpoint = "/Volumes/FuseStream"   # macOS default; e.g. "/mnt/fusestream" on 
 fetch_mode = "temp-file"   # default: downloads entire file to temp dir (reliable, recommended)
                            # experimental: "range-lru" (streams chunks on-demand, memory-based cache)
 temp_dir = "/tmp"          # temp file directory (only used in temp-file mode)
+
+# macOS system integration (optional):
+enable_app_nap = false     # Prevent App Nap when filesystem is mounted (default: false)
+                           # Enable if you experience performance issues when app loses focus
 ```
 
 Environment variable overrides (take precedence):
@@ -95,6 +109,7 @@ Environment variable overrides (take precedence):
 - `FSMVP_MOUNTPOINT`
 - `FSMVP_FETCH_MODE` (`temp-file` or `range-lru`)
 - `FSMVP_TEMP_DIR`
+- `FSMVP_ENABLE_APP_NAP` (`true`, `1`, or `yes` to enable)
 
 > The short‑lived **OAuth token is cached in memory only**.
 
@@ -116,29 +131,126 @@ For most users, the default `temp-file` mode is recommended.
 
 ---
 
-## Development
+## macOS App Nap Prevention & Process Throttling
 
-- **macOS**: install **macFUSE** (FSKit backend). No Recovery Mode changes required on 15.4+.
-- **Linux**: ensure **fuse3** and user has FUSE permission.
+**Critical for Finder-launched apps:** When the app is launched from Finder (without a console) and loses focus, macOS may throttle the process via **App Nap**, causing FUSE filesystem operations to stall. This manifests as:
+- Uploads freezing when switching to the browser
+- `ls /Volumes/FuseStream` hanging until the app window is closed
+- The app becoming unresponsive when in the background
+
+### Prevention Strategy (Implemented)
+
+The app uses a **dual-layer approach** to prevent process throttling:
+
+1. **Runtime App Nap Prevention (Primary)**
+   - Uses `NSProcessInfo beginActivityWithOptions:` with flags:
+     - `NSActivityUserInitiated` - User-initiated activity (prevents App Nap)
+     - `NSActivityLatencyCritical` - Highest priority, latency-critical
+     - `NSActivityIdleSystemSleepDisabled` - Also prevents idle system sleep
+   - Token is acquired when filesystem mounts, released on unmount
+   - Located in `internal/appnap/` package
+
+2. **Info.plist Backstop (Secondary)**
+   - `NSAppSleepDisabled` key set to `true` in `build/darwin/Info.plist`
+   - Provides additional insurance against process throttling
+   - Applied at app bundle level by Wails build
+
+3. **System Sleep Prevention (During Transfers)**
+   - Uses `IOPMAssertion` (IOKit Power Management) during active file transfers
+   - Prevents full system sleep while file handles are open
+   - Located in `internal/sleep/` package
+   - Note: IOPMAssertion prevents **system sleep** but NOT **App Nap** throttling
+
+### Thread Safety
+
+All FUSE operations are **background-thread safe**:
+- The FUSE mount runs in a dedicated goroutine (not main thread)
+- All FUSE callbacks (Getattr, Readdir, Open, Read, etc.) execute on the mount goroutine
+- No synchronous main thread calls from FUSE code paths
+- Logging and error handling are async and non-blocking
+
+### Lifecycle Monitoring
+
+The app observes NSApplication lifecycle events:
+- `NSApplicationDidBecomeActiveNotification` - app enters foreground
+- `NSApplicationDidResignActiveNotification` - app enters background
+- After losing focus, filesystem responsiveness is tested to detect latent deadlocks
+- All lifecycle events are logged to the persistent log file
+
+### Diagnostic Logging
+
+**Log location:** `~/Library/Logs/FuseStream/fusestream.log`
+
+Key log entries to look for:
+- `[appnap] App Nap prevention enabled` - Runtime prevention is active
+- `[sleep] Sleep prevention enabled` - System sleep prevention active during transfers
+- `[lifecycle] App resigned active (background)` - App lost focus
+- `[lifecycle] FS responsive after resign active` - Filesystem still working in background
+- `[lifecycle] WARNING: FS unresponsive` - Filesystem stalled (indicates throttling issue)
+
+Logs are automatically rotated (max 10MB per file, 5 files kept).
+
+---
+
+## Development (macOS)
+
+### Prerequisites
+
+**Critical Requirements:**
+- **macOS ≥15.4** (Sequoia or later) - Required for FSKit support
+- **macFUSE ≥5** with FSKit backend - Install from [macfuse.io](https://macfuse.io/)
+  - FSKit backend eliminates kernel extension (kext) requirement
+  - No Recovery Mode changes needed
+  - Verified with: `/Library/Filesystems/macfuse.fs` should exist after installation
+  - App uses `-o backend=fskit` mount option
+
+**Build Tools:**
+- **Go 1.22+**
+- **Wails CLI**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+
+**Why FSKit?**
+- macOS 15.4+ uses FSKit (File System Kit) - a user-space file system framework
+- No kernel extensions = no System Integrity Protection (SIP) warnings
+- More stable and secure than legacy kext approach
+- See: [macFUSE FSKit backend documentation](https://github.com/macfuse/macfuse/wiki/Getting-Started)
+
+**FSKit Mountpoint Requirements:**
+- **FSKit only supports mountpoints under `/Volumes/`** - Apple's hard limitation
+- `/Volumes/` is root-owned; applications **cannot** create directories there directly
+- The macFUSE mount helper (`mount_macfuse`) runs with setuid root privileges and creates the mountpoint automatically during mounting
+- **Do not manually create** `/Volumes/FuseStream/` - the mount process handles this
+- For testing with non-`/Volumes` paths (e.g., `~/test-mount`), the application will create the directory automatically
 
 ### Build
 
-**Important:** Wails applications **must** be built using the `wails` CLI (not `go build`) to include the required build tags.
+**Important:** GUI and CLI builds use separate entry points with build tags:
+- **GUI app**: `main.go` at project root (built with Wails, has `//go:build gui` tag)
+- **CLI app**: `cmd/cli/main.go` (built with `go build`, has `//go:build !gui` tag)
 
 ```bash
 # Install Wails CLI
 go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-# Production build (GUI app)
-wails build -skipbindings
+# Build GUI app (.app bundle)
+wails build -tags "fuse,gui,production" -skipbindings
 
-# Binaries will be in build/bin/
-# - Linux: build/bin/fuse-stream-mvp
-# - macOS: build/bin/fuse-stream-mvp.app
+# Binary will be in build/bin/fuse-stream-mvp.app
 
-# Headless build (for dev/testing, no GUI)
-go build -tags fuse -o fuse-stream-mvp-headless .
+# Build CLI tool (headless, for testing/automation)
+go build -tags fuse -o fuse-stream-cli ./cmd/cli
 ```
+
+### Build Tags Explained
+
+- **GUI build**: Requires `gui` tag to compile root `main.go`
+  - Command: `wails build -tags "fuse,gui,production"`
+  - Tags: `fuse` (FUSE support), `gui` (enables GUI main), `production` (Wails optimization)
+- **CLI build**: Uses `!gui` tag to exclude root main.go
+  - Command: `go build -tags fuse -o fuse-stream-cli ./cmd/cli`
+  - Tags: `fuse` (FUSE support), no `gui` tag (enables CLI main)
+- Build tag guards ensure only one `main()` per build:
+  - Root `main.go`: `//go:build gui`
+  - `cmd/cli/main.go`: `//go:build !gui`
 
 ### Run (local)
 
@@ -151,34 +263,62 @@ wails dev
 
 This launches the app with hot-reload for frontend changes and proper build tags.
 
-**Option 2: Production build**
+**Option 2: Production GUI build**
 
 ```bash
-# Build first
-wails build -skipbindings
+# Build GUI app first
+wails build -tags "fuse,gui,production" -skipbindings
 
 # Then run
-./build/bin/fuse-stream-mvp              # Linux
-# or
 open ./build/bin/fuse-stream-mvp.app     # macOS
 ```
 
-**Option 3: Headless mode (no GUI)**
+**Option 3: CLI mode (no GUI)**
 
 ```bash
-# Build with FUSE support
-go build -tags fuse -o fuse-stream-mvp-headless .
+# Build CLI tool
+go build -tags fuse -o fuse-stream-cli ./cmd/cli
 
-# Run without GUI (daemon only)
-./fuse-stream-mvp-headless --headless
+# Run CLI (mount and keep alive)
+./fuse-stream-cli --mount
+
+# Or unmount
+./fuse-stream-cli --unmount
 ```
 
 This starts the daemon (FUSE mount + HTTP server) without launching a window. Useful for CI or manual testing.
 
-The GUI app mounts (e.g., `/Volumes/FuseStream`) and opens a window:
+The GUI app mounts at `/Volumes/FuseStream` and opens a window:
 - List jobs → pick output (if multiple) → enter recipient id → **Stage for upload**
 - A file appears in `Staged/` and a big draggable tile is shown.
 - Drag the tile into the target site's upload zone; upload continues in background.
+
+### Troubleshooting
+
+**Mount fails with "unknown option" or "backend not found":**
+- Verify macFUSE ≥5 is installed: `ls /Library/Filesystems/macfuse.fs`
+- Check macOS version: `sw_vers` (should show ≥15.4)
+- Reinstall macFUSE from [macfuse.io](https://macfuse.io/)
+
+**"Operation not permitted" or permission errors:**
+- Ensure System Settings → Privacy & Security allows macFUSE
+- Check that mountpoint directory is writable
+
+**App crashes during drag:**
+- Check Console.app for crash logs
+- Verify file is visible in Finder at `/Volumes/FuseStream/Staged/`
+- Try restarting the app (mount recovery will handle stale mounts)
+
+**Sleep prevention not working:**
+- Check logs for `[sleep] Sleep prevention enabled` and `[appnap] App Nap prevention enabled`
+- Verify IOKit and Foundation frameworks are available
+- macOS may override sleep prevention for low battery or scheduled sleep
+
+**App becomes unresponsive when launched from Finder:**
+- Check `~/Library/Logs/FuseStream/fusestream.log` for diagnostic logs
+- Look for `[lifecycle]` entries showing foreground/background transitions
+- Verify App Nap prevention is enabled: `[appnap] App Nap prevention enabled`
+- If filesystem becomes unresponsive after losing focus, check logs for `[lifecycle] WARNING: FS unresponsive`
 
 ### Testing
 
@@ -225,11 +365,28 @@ In CI, live tests run automatically on push and pull requests, using repository 
 - Wire UI: “Stage for upload” adds/removes items; show progress (bytes served vs. total).
 - **Acceptance:** dragging the staged file into a browser upload zone starts an upload; overlapping transfer observed on a large test file.
 
-### M3 — Polish
-- Sleep prevention while file handles are open.
-- Error surfaces (expired URL → refresh once; 5xx → retry with backoff).
-- Cache eviction after reader closes; concurrent staging.
-- Optional: HMAC download URL flow as alternative to Bearer.
+### M3 — macOS-only MVP (Current)
+**M3 is macOS-only** with production-ready features:
+- ✅ **macOS FSKit backend**: Uses `-o backend=fskit` for user-space FUSE (no kext)
+- ✅ **Self-hosted CI build**: Single macOS job on `[self-hosted, macOS, ARM64, macFUSE]` runner
+- ✅ **Robust Cocoa drag-and-drop**: Idempotent with re-entrancy guards, validation, and proper NSPasteboardTypeFileURL usage
+- ✅ **Mount recovery**: Automatic detection and cleanup of stale mounts using `diskutil unmount force`
+- ✅ **Sleep prevention**: IOPMAssertionCreateWithName integration (active during file handles open)
+- ✅ **Dual-ref eviction**: tileRef + openRef system prevents premature cache eviction
+- ✅ **Multi-open support**: BackingStore ref counting handles concurrent/repeated file opens
+- ✅ **Error guidance**: Clear error messages if mount fails (FSKit/macFUSE version requirements)
+- ❌ **Linux GTK drag removed**: Linux builds show error message (M3 is macOS-only)
+
+**Acceptance criteria:**
+- [ ] CI `macos-fskit-build` job passes on self-hosted runner (single macOS job)
+- [ ] App mounts successfully using FSKit backend (verify with `-o backend=fskit`)
+- [ ] No kernel extension prompts or Recovery Mode requirements
+- [ ] Cocoa drag works reliably (Safari/Chrome, no crashes, no stale pointers)
+- [ ] Mount recovery handles stale mounts from force-quit/crash
+- [ ] Sleep prevention activates during uploads (check logs)
+- [ ] Staging a new file doesn't break in-progress upload
+- [ ] Multiple drag attempts on same tile work correctly
+- [ ] Mount failure shows actionable error message with macFUSE/FSKit guidance
 
 ---
 

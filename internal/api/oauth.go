@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,12 +13,13 @@ import (
 )
 
 type TokenCache struct {
-	mu          sync.RWMutex
-	token       string
-	expiresAt   time.Time
-	clientID    string
+	mu           sync.RWMutex
+	token        string
+	expiresAt    time.Time
+	clientID     string
 	clientSecret string
-	apiBase     string
+	apiBase      string
+	httpClient   *http.Client
 }
 
 func NewTokenCache(apiBase, clientID, clientSecret string) *TokenCache {
@@ -25,6 +27,14 @@ func NewTokenCache(apiBase, clientID, clientSecret string) *TokenCache {
 		apiBase:      apiBase,
 		clientID:     clientID,
 		clientSecret: clientSecret,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
 	}
 }
 
@@ -39,6 +49,7 @@ func (tc *TokenCache) GetToken() (string, error) {
 	if tc.token != "" && time.Now().Before(tc.expiresAt.Add(-30*time.Second)) {
 		token := tc.token
 		tc.mu.RUnlock()
+		log.Printf("[OAuth] Using cached token")
 		return token, nil
 	}
 	tc.mu.RUnlock()
@@ -47,9 +58,11 @@ func (tc *TokenCache) GetToken() (string, error) {
 	defer tc.mu.Unlock()
 
 	if tc.token != "" && time.Now().Before(tc.expiresAt.Add(-30*time.Second)) {
+		log.Printf("[OAuth] Using cached token (double-check)")
 		return tc.token, nil
 	}
 
+	log.Printf("[OAuth] Fetching new token from %s/oauth2/token/", tc.apiBase)
 	data := url.Values{}
 	data.Set("grant_type", "client_credential")
 	data.Set("client_id", tc.clientID)
@@ -62,11 +75,13 @@ func (tc *TokenCache) GetToken() (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := tc.httpClient.Do(req)
 	if err != nil {
+		log.Printf("[OAuth] Token request error: %v", err)
 		return "", fmt.Errorf("token request: %w", err)
 	}
 	defer resp.Body.Close()
+	log.Printf("[OAuth] Token response status: %d", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

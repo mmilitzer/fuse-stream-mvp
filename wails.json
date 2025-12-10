@@ -17,7 +17,10 @@
     "productName": "FuseStream MVP",
     "productVersion": "0.1.0",
     "copyright": "Copyright.........",
-    "comments": "M1: Scaffold API + UI"
+    "comments": "M3: macOS-only MVP with FSKit, robust drag, mount recovery, and App Nap prevention"
   },
-  "nsisType": "multiple"
+  "nsisType": "multiple",
+  "darwin": {
+    "plist": "build/darwin/Info.plist"
+  }
 }

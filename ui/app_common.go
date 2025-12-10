@@ -3,10 +3,16 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/drag"
+)
+
+var (
+	appInstance *App
+	appMu       sync.Mutex
 )
 
 type App struct {
@@ -15,9 +21,20 @@ type App struct {
 }
 
 func NewApp(client *api.Client) *App {
-	return &App{
+	appMu.Lock()
+	defer appMu.Unlock()
+	
+	appInstance = &App{
 		client: client,
 	}
+	return appInstance
+}
+
+// GetAppInstance returns the global app instance (used by app delegate)
+func GetAppInstance() *App {
+	appMu.Lock()
+	defer appMu.Unlock()
+	return appInstance
 }
 
 func (a *App) Startup(ctx context.Context) {
@@ -35,6 +52,20 @@ type OutputInfo struct {
 	FileName    string `json:"fileName"`
 	Size        int64  `json:"size"`
 	ContentType string `json:"contentType"`
+}
+
+type ListJobsRequest struct {
+	Page       int    `json:"page"`       // Page number (0-indexed)
+	PageSize   int    `json:"pageSize"`   // Items per page
+	NameFilter string `json:"nameFilter"` // Optional name filter
+}
+
+type ListJobsResult struct {
+	Jobs       []JobInfo `json:"jobs"`
+	Total      int       `json:"total"`
+	Page       int       `json:"page"`
+	PageSize   int       `json:"pageSize"`
+	TotalPages int       `json:"totalPages"`
 }
 
 func (a *App) GetJobs() ([]JobInfo, error) {
@@ -61,6 +92,63 @@ func (a *App) GetJobs() ([]JobInfo, error) {
 		})
 	}
 	return result, nil
+}
+
+func (a *App) GetJobsPaginated(req ListJobsRequest) (*ListJobsResult, error) {
+	// Set defaults
+	if req.PageSize == 0 {
+		req.PageSize = 5
+	}
+	if req.Page < 0 {
+		req.Page = 0
+	}
+
+	// Call API with pagination options
+	opts := api.ListJobsOptions{
+		Start:      req.Page * req.PageSize,
+		Limit:      req.PageSize,
+		Sort:       "created_at",
+		Direction:  "-1", // Newest first
+		NameFilter: req.NameFilter,
+	}
+
+	resp, err := a.client.ListJobsWithOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert jobs to UI format
+	jobs := make([]JobInfo, 0, len(resp.Jobs))
+	for _, job := range resp.Jobs {
+		outputs := make([]OutputInfo, 0, len(job.Outputs))
+		for _, out := range job.Outputs {
+			outputs = append(outputs, OutputInfo{
+				FileID:      out.FileID,
+				FileName:    out.FileName,
+				Size:        out.Size,
+				ContentType: out.ContentType,
+			})
+		}
+		jobs = append(jobs, JobInfo{
+			ID:        job.ID,
+			InputName: job.InputName,
+			Outputs:   outputs,
+		})
+	}
+
+	// Calculate total pages
+	totalPages := (resp.Total + req.PageSize - 1) / req.PageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	return &ListJobsResult{
+		Jobs:       jobs,
+		Total:      resp.Total,
+		Page:       req.Page,
+		PageSize:   req.PageSize,
+		TotalPages: totalPages,
+	}, nil
 }
 
 type StageRequest struct {
@@ -168,4 +256,19 @@ func (a *App) EvictAllStagedFiles() error {
 		return fmt.Errorf("filesystem not available")
 	}
 	return filesystem.EvictAllStagedFiles()
+}
+
+// HasActiveUploads returns true if there are active file handles open (uploads in progress).
+func (a *App) HasActiveUploads() bool {
+	filesystem := daemon.GetFS()
+	if filesystem == nil {
+		return false
+	}
+	return filesystem.HasActiveUploads()
+}
+
+// ShowQuitConfirmation shows a native confirmation dialog and quits if user confirms.
+// This is called asynchronously from OnBeforeClose when there are active uploads.
+func (a *App) ShowQuitConfirmation() {
+	showQuitConfirmationDialog()
 }

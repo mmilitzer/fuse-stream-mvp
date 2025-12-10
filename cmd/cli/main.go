@@ -1,37 +1,48 @@
-//go:build gui
+//go:build !gui
 
 package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
-
-	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
-	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
-	"github.com/mmilitzer/fuse-stream-mvp/ui"
+)
+
+var (
+	mount   = flag.Bool("mount", false, "Mount the filesystem and keep alive (default mode)")
+	unmount = flag.Bool("unmount", false, "Unmount the filesystem and exit")
 )
 
 func main() {
-	// Initialize file logging first so we can diagnose Finder-launch issues
-	if err := logging.Init(""); err != nil {
-		log.Printf("Warning: Failed to initialize file logging: %v", err)
-		// Continue anyway - we'll just use stdout/stderr
-	}
-	defer logging.Close()
+	flag.Parse()
 
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Handle --unmount flag
+	if *unmount {
+		log.Printf("Unmounting filesystem at %s...", cfg.Mountpoint)
+		
+		// Try diskutil on macOS first, then umount
+		if err := exec.Command("diskutil", "unmount", "force", cfg.Mountpoint).Run(); err != nil {
+			log.Printf("diskutil failed, trying umount: %v", err)
+			if err := exec.Command("umount", "-f", cfg.Mountpoint).Run(); err != nil {
+				log.Fatalf("Failed to unmount: %v", err)
+			}
+		}
+		
+		log.Printf("Successfully unmounted %s", cfg.Mountpoint)
+		return
 	}
 
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
@@ -54,31 +65,13 @@ func main() {
 		cancel()
 	}()
 
-	// Start daemon services (FUSE mount) in background
+	// Start daemon services (FUSE mount)
 	if err := daemon.Start(ctx, cfg.Mountpoint, client, cfg); err != nil {
 		log.Fatalf("Failed to start daemon: %v", err)
 	}
 
-	// Launch Wails GUI
-	app := ui.NewApp(client)
-
-	err = wails.Run(&options.App{
-		Title:  "FuseStream MVP",
-		Width:  900,
-		Height: 700,
-		AssetServer: &assetserver.Options{
-			Assets: frontend.Assets,
-		},
-		OnStartup: app.Startup,
-		OnShutdown: func(ctx context.Context) {
-			cancel() // Trigger daemon shutdown
-		},
-		Bind: []interface{}{
-			app,
-		},
-	})
-
-	if err != nil {
-		log.Fatalf("Error launching app: %v", err)
-	}
+	// Keep alive mode: mount and wait for signal
+	log.Println("Filesystem mounted. Press Ctrl+C to unmount and exit.")
+	log.Printf("Mountpoint: %s", cfg.Mountpoint)
+	daemon.KeepAlive(ctx)
 }

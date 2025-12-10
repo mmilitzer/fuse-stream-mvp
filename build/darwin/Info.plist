@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>FuseStream MVP</string>
+	<key>CFBundleDisplayName</key>
+	<string>FuseStream MVP</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.fusestream.mvp</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleExecutable</key>
+	<string>fuse-stream-mvp</string>
+	<key>CFBundleIconFile</key>
+	<string>iconfile</string>
+	
+	<!-- Disable App Nap at the plist level as a backstop -->
+	<!-- The runtime NSProcessInfo activity token is the primary mechanism, -->
+	<!-- but this provides additional insurance against process throttling -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
+	
+	<!-- High-resolution display support -->
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	
+	<!-- Minimum macOS version (FSKit requires macOS 15.4+) -->
+	<key>LSMinimumSystemVersion</key>
+	<string>15.4</string>
+</dict>
+</plist>

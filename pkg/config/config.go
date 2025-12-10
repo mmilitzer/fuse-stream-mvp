@@ -20,6 +20,9 @@ type Config struct {
 	ChunkSize             int    `toml:"chunk_size"`              // chunk size in bytes
 	MaxConcurrentRequests int    `toml:"max_concurrent_requests"` // max concurrent HTTP requests
 	CacheSize             int    `toml:"cache_size"`              // LRU cache size in chunks (range-lru mode only)
+	
+	// System integration configuration
+	EnableAppNap bool `toml:"enable_app_nap"` // Prevent App Nap when filesystem is mounted (macOS only, default: false)
 }
 
 func Load() (*Config, error) {
@@ -65,6 +68,9 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("FSMVP_TEMP_DIR"); v != "" {
 		cfg.TempDir = v
+	}
+	if v := os.Getenv("FSMVP_ENABLE_APP_NAP"); v != "" {
+		cfg.EnableAppNap = v == "true" || v == "1" || v == "yes"
 	}
 
 	return cfg, nil

@@ -1,0 +1,120 @@
+name: FSKit Debug Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/m3-macos-fskit
+
+jobs:
+  fskit-debug:
+    runs-on: [self-hosted, macOS, ARM64, macFUSE]
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      
+      - name: System Information
+        run: |
+          echo "=== System Information ==="
+          sw_vers
+          uname -a
+          echo ""
+          echo "=== Go Version ==="
+          go version
+          echo ""
+          echo "=== macFUSE Check ==="
+          which mount_macfuse || echo "mount_macfuse not found in PATH"
+          ls -la /Library/Filesystems/macfuse.fs 2>/dev/null || echo "macfuse.fs not found"
+          ls -la /Library/Extensions/macfuse.kext 2>/dev/null || echo "macfuse.kext not found"
+          echo ""
+          echo "=== Current Mounts ==="
+          mount | grep -i fuse || echo "No FUSE mounts found"
+      
+      - name: Run Test 1 - macFUSE Installation Check
+        run: |
+          echo "Running Test 1: macFUSE Installation Check"
+          go test -v -tags fuse -run TestFSKit_MacFUSEInstallation ./internal/fs 2>&1 | tee test1.log
+        continue-on-error: true
+      
+      - name: Run Test 2 - Basic FUSE Mount
+        run: |
+          echo "Running Test 2: Basic FUSE Mount (no FSKit)"
+          go test -v -tags fuse -run TestFSKit_BasicFUSEMount ./internal/fs -timeout 30s 2>&1 | tee test2.log
+        continue-on-error: true
+      
+      - name: Run Test 3 - FSKit Backend Mount
+        run: |
+          echo "Running Test 3: FUSE Mount with backend=fskit"
+          go test -v -tags fuse -run TestFSKit_FSKitBackendMount ./internal/fs -timeout 30s 2>&1 | tee test3.log
+        continue-on-error: true
+      
+      - name: Run Test 4 - Different Option Formats
+        run: |
+          echo "Running Test 4: Testing Different FSKit Option Formats"
+          go test -v -tags fuse -run TestFSKit_DifferentOptionFormats ./internal/fs -timeout 60s 2>&1 | tee test4.log
+        continue-on-error: true
+      
+      - name: Run Test 5 - Mount Recovery
+        run: |
+          echo "Running Test 5: Mount Recovery Mechanism"
+          go test -v -tags fuse -run TestFSKit_MountRecovery ./internal/fs -timeout 30s 2>&1 | tee test5.log
+        continue-on-error: true
+      
+      - name: Run Test 6 - Mount Command Details
+        run: |
+          echo "Running Test 6: Mount Command Details"
+          go test -v -tags fuse -run TestFSKit_MountCommandDetails ./internal/fs -timeout 30s 2>&1 | tee test6.log
+        continue-on-error: true
+      
+      - name: Run Test 7 - Full Integration
+        run: |
+          echo "Running Test 7: Full Integration Test"
+          go test -v -tags fuse -run TestFSKit_FullIntegration ./internal/fs -timeout 30s 2>&1 | tee test7.log
+        continue-on-error: true
+      
+      - name: Collect All Test Logs
+        if: always()
+        run: |
+          echo "=== ALL TEST RESULTS ==="
+          echo ""
+          for i in {1..7}; do
+            if [ -f "test${i}.log" ]; then
+              echo "========================================"
+              echo "TEST $i LOG"
+              echo "========================================"
+              cat "test${i}.log"
+              echo ""
+              echo ""
+            fi
+          done
+      
+      - name: Check for Stale Mounts After Tests
+        if: always()
+        run: |
+          echo "=== Checking for stale mounts ==="
+          mount | grep -i fuse || echo "No FUSE mounts found"
+          echo ""
+          echo "=== Cleaning up any test mountpoints ==="
+          for dir in /tmp/fuse-test-*; do
+            if [ -d "$dir" ]; then
+              echo "Attempting to unmount $dir"
+              diskutil unmount force "$dir" 2>&1 || umount -f "$dir" 2>&1 || true
+              rm -rf "$dir" 2>&1 || true
+            fi
+          done
+      
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fskit-debug-logs
+          path: |
+            test*.log
+          retention-days: 7
