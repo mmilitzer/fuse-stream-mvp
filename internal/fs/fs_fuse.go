@@ -86,6 +86,15 @@ func newFS(client *api.Client, cfg *config.Config) FS {
 func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
 	
+	// Initialize non-blocking FUSE logger FIRST (before any FUSE operations)
+	// This ensures all FUSE callbacks can log without blocking
+	if err := logging.InitFUSELogger(); err != nil {
+		log.Printf("[fs] Warning: failed to initialize FUSE logger: %v", err)
+		// Continue anyway - logging is not critical for functionality
+	} else {
+		log.Printf("[fs] FUSE logger initialized successfully")
+	}
+	
 	// Clean up stale temp files from previous runs
 	tempDir := fs.config.TempDir
 	if tempDir == "" {
@@ -299,11 +308,23 @@ func (fs *fuseFS) Stop() error {
 		log.Println("[fs] Unmounting filesystem...")
 		if !fs.host.Unmount() {
 			log.Println("[fs] Normal unmount failed")
+			
+			// Close FUSE logger before returning
+			logging.CloseFUSELogger()
+			
 			return fmt.Errorf("failed to unmount filesystem")
 		}
 		log.Println("[fs] Filesystem unmounted successfully")
 	}
 	fs.mounted = false
+	
+	// Close FUSE logger AFTER unmount completes
+	// This ensures we capture all FUSE operation logs
+	log.Println("[fs] Closing FUSE logger...")
+	if err := logging.CloseFUSELogger(); err != nil {
+		log.Printf("[fs] Warning: error closing FUSE logger: %v", err)
+	}
+	
 	return nil
 }
 
@@ -686,24 +707,24 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				sf.storeMu.Lock()
 				needsInit := (sf.store == nil)
 				if needsInit {
-					log.Printf("Open: Backing store needs initialization for %s", sf.FileName)
+					logging.FUSELog("[Open] Backing store needs initialization for %s", sf.FileName)
 				}
 				sf.storeMu.Unlock()
 				
 				// If initialization is needed, do it WITHOUT holding the lock
 				if needsInit {
-					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
+					logging.FUSELog("[Open] Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
 					
 					// Build temp URL (network I/O - must not hold locks)
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
-						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
+						logging.FUSELog("[Open] Failed to build temp URL for %s: %v", sf.FileName, err)
 						sf.storeMu.Lock()
 						sf.Status = "error"
 						sf.storeMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
 					}
-					log.Printf("Open: Got temp URL for %s: %s", sf.FileName, tempURL)
+					logging.FUSELog("[Open] Got temp URL for %s: %s", sf.FileName, tempURL)
 
 					// Create store options from config
 					storeOpts := fetcher.StoreOptions{
@@ -726,7 +747,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 					// Create backing store (may do I/O - must not hold locks)
 					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
 					if err != nil {
-						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
+						logging.FUSELog("[Open] Failed to create backing store for %s: %v", sf.FileName, err)
 						sf.storeMu.Lock()
 						sf.Status = "error"
 						sf.storeMu.Unlock()
@@ -739,11 +760,11 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 						// We won the race, use our store
 						sf.store = store
 						sf.Status = "open"
-						log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
+						logging.FUSELog("[Open] Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
 					} else {
 						// Someone else initialized it, close ours
 						store.Close()
-						log.Printf("Open: Backing store was initialized by another caller, discarding duplicate")
+						logging.FUSELog("[Open] Backing store was initialized by another caller, discarding duplicate")
 					}
 					sf.storeMu.Unlock()
 				}
@@ -775,7 +796,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				}
 				
 				tileRef := atomic.LoadInt32(&sf.tileRef)
-				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
+				logging.FUSELog("[Open] %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
 					sf.FileName, fh, tileRef, newOpenRef, store.RefCount())
 				
 				return 0, fh
@@ -795,7 +816,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	fs.fhMu.RUnlock()
 	
 	if !exists || store == nil {
-		log.Printf("Read: Invalid file handle %d", fh)
+		logging.FUSELog("[Read] Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
 
@@ -809,7 +830,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 		}
 		// For other errors, only fail if we read nothing
 		if n == 0 {
-			log.Printf("Read: I/O error at fh=%d off=%d: %v", fh, ofst, err)
+			logging.FUSELog("[Read] I/O error at fh=%d off=%d: %v", fh, ofst, err)
 			return -fuse.EIO
 		}
 		// If we got some data despite error, return the data (partial read)
@@ -831,7 +852,7 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	fs.fhMu.Unlock()
 	
 	if !exists || store == nil {
-		log.Printf("Release: Invalid file handle %d", fh)
+		logging.FUSELog("[Release] Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
 	
@@ -846,18 +867,18 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	if sfExists {
 		newOpenRef := atomic.AddInt32(&sff.openRef, -1)
 		tileRef := atomic.LoadInt32(&sff.tileRef)
-		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)", 
+		logging.FUSELog("[Release] fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)", 
 			fh, tileRef, newOpenRef, newStoreRefCount)
 		
 		// If both refs are 0, try to evict
 		if tileRef == 0 && newOpenRef == 0 {
-			log.Printf("Release: Both refs are 0 for %s, attempting eviction", stagedID)
+			logging.FUSELog("[Release] Both refs are 0 for %s, attempting eviction", stagedID)
 			fs.mu.Lock()
 			fs.tryEvictLocked(stagedID)
 			fs.mu.Unlock()
 		}
 	} else {
-		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
+		logging.FUSELog("[Release] fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
 			fh, newStoreRefCount)
 	}
 	

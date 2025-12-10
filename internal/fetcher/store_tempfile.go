@@ -222,6 +222,8 @@ func (s *TempFileStore) Close() error {
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
+// CRITICAL: This is called from FUSE Read operations and must not block unnecessarily.
+// We hold the lock ONLY to check state, never during file I/O.
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off >= s.size {
 		return 0, io.EOF
@@ -235,10 +237,17 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 
 	// Wait until desired region is downloaded or an error/ctx cancel
+	// CRITICAL: We must check downloaded/err WITHOUT holding any locks
+	// that could be held during I/O operations elsewhere
 	s.cond.L.Lock()
 	for {
+		// Read state atomically
 		downloaded := s.downloaded.Load()
-		err := s.getError()
+		
+		// Check error without holding errMu during the wait
+		s.errMu.RLock()
+		err := s.err
+		s.errMu.RUnlock()
 
 		// If we have enough data, proceed
 		if downloaded >= wantEnd {
@@ -258,11 +267,12 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 			return 0, ctx.Err()
 		}
 
-		// Wait for more data
+		// Wait for more data (releases lock temporarily)
 		s.cond.Wait()
 	}
 
-	// Read from temp file
+	// At this point, we have released s.cond.L and we're not holding ANY locks
+	// Now perform file I/O without holding any locks
 	f, err := os.Open(s.tempPath)
 	if err != nil {
 		return 0, fmt.Errorf("open temp file: %w", err)
@@ -271,7 +281,7 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 
 	n, err := f.ReadAt(p, off)
 	
-	// Update access time in manager
+	// Update access time in manager (this is quick, just updates a timestamp)
 	if manager := globalManager; manager != nil {
 		manager.UpdateAccess(s.tempPath)
 	}
