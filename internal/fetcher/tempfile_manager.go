@@ -257,13 +257,23 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 	
 	if !spaceOK {
 		total, available, _ := m.GetDiskUsage()
-		return fmt.Errorf("insufficient disk space: need %d MB, have %d MB available (total=%d MB, 70%% limit=%d MB)", 
-			fileSize/(1024*1024), 
+		// Format file size better - show bytes for small files, MB for large ones
+		var sizeStr string
+		if fileSize < 1024*1024 {
+			sizeStr = fmt.Sprintf("%d bytes", fileSize)
+		} else {
+			sizeStr = fmt.Sprintf("%d MB", fileSize/(1024*1024))
+		}
+		return fmt.Errorf("insufficient disk space: need %s, have %d MB available (total=%d MB, 70%% limit=%d MB)", 
+			sizeStr,
 			available/(1024*1024),
 			total/(1024*1024),
 			(total*MaxDiskUsagePercent/100)/(1024*1024))
 	}
 	
+	// Note: We check >= MaxTempFiles (not >) because this function ensures space for 
+	// ONE MORE file to be added. If we have 10 files (the max), there's no room.
+	// After successful eviction, we should have < MaxTempFiles.
 	if finalFileCount >= MaxTempFiles {
 		return fmt.Errorf("too many temp files: %d (max=%d)", finalFileCount, MaxTempFiles)
 	}
