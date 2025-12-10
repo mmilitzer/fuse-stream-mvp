@@ -20,5 +20,5 @@ func FUSETrace(operation string, format string, args ...interface{}) func() {
 // Usage:
 //   defer FUSETraceSimple("Statfs")()
 func FUSETraceSimple(operation string) func() {
-	return FUSETraceNonBlocking(operation, "", nil...)
+	return FUSETraceNonBlocking(operation, "")
 }
