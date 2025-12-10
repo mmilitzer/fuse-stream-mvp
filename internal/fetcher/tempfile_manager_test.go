@@ -73,7 +73,7 @@ func TestRegisterAndUnregister(t *testing.T) {
 	size := int64(1024)
 
 	// Register
-	manager.Register(path, size)
+	manager.Register(path, size, nil)
 
 	if len(manager.files) != 1 {
 		t.Errorf("Expected 1 file registered, got %d", len(manager.files))
@@ -110,7 +110,7 @@ func TestUpdateAccess(t *testing.T) {
 	path := "/tmp/test.tmp"
 	size := int64(1024)
 
-	manager.Register(path, size)
+	manager.Register(path, size, nil)
 	
 	originalTime := manager.files[path].LastAccess
 	time.Sleep(10 * time.Millisecond)
@@ -149,7 +149,7 @@ func TestEnsureSpaceAvailable(t *testing.T) {
 		if err := os.WriteFile(path, []byte("test data"), 0600); err != nil {
 			t.Fatalf("Failed to create test file: %v", err)
 		}
-		manager.Register(path, int64(100))
+		manager.Register(path, int64(100), nil)
 		time.Sleep(1 * time.Millisecond) // Ensure different access times
 	}
 
@@ -177,7 +177,7 @@ func TestMaxTempFiles(t *testing.T) {
 		if err := os.WriteFile(path, []byte("test data"), 0600); err != nil {
 			t.Fatalf("Failed to create test file: %v", err)
 		}
-		manager.Register(path, int64(100))
+		manager.Register(path, int64(100), nil)
 		time.Sleep(1 * time.Millisecond) // Ensure different access times
 	}
 

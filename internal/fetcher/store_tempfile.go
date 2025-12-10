@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -27,6 +28,7 @@ type TempFileStore struct {
 	// Reference counting and lifecycle
 	refCount atomic.Int32
 	closed   atomic.Bool
+	evicted  atomic.Bool // Set to true when TempFileManager evicts the file
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
@@ -56,9 +58,6 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 	}
 	tempPath := tempFile.Name()
 	tempFile.Close() // We'll reopen for writing in the downloader
-	
-	// Register with manager
-	manager.Register(tempPath, size)
 
 	// Create store
 	ctx, cancel := context.WithCancel(ctx)
@@ -70,6 +69,12 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		cancel:   cancel,
 	}
 	store.cond = sync.NewCond(&sync.Mutex{})
+	
+	// Register with callback to mark as evicted when TempFileManager deletes the file
+	manager.Register(tempPath, size, func() {
+		log.Printf("[tempfile] BackingStore notified of eviction: %s", tempPath)
+		store.evicted.Store(true)
+	})
 
 	// Start downloader goroutine
 	store.wg.Add(1)
@@ -187,6 +192,11 @@ func (s *TempFileStore) RefCount() int32 {
 // TempPath returns the path to the temporary file.
 func (s *TempFileStore) TempPath() string {
 	return s.tempPath
+}
+
+// IsEvicted returns true if the temp file was evicted by TempFileManager.
+func (s *TempFileStore) IsEvicted() bool {
+	return s.evicted.Load()
 }
 
 // Close releases resources and deletes the temp file.

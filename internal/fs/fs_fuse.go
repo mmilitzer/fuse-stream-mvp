@@ -375,25 +375,16 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 	
 	// Check if this file is already staged
 	if existingSff, exists := fs.stagedFiles[id]; exists {
-		// File already staged - verify BackingStore is still valid
+		// File already staged - check if BackingStore was evicted by TempFileManager
 		existingSff.storeMu.Lock()
-		storeValid := false
 		if existingSff.store != nil {
-			// Check if temp file still exists (TempFileManager might have evicted it)
-			if tempStore, ok := existingSff.store.(*fetcher.TempFileStore); ok {
-				if tempPath := tempStore.TempPath(); tempPath != "" {
-					if _, err := os.Stat(tempPath); err == nil {
-						storeValid = true
-					} else {
-						log.Printf("StageFile: Temp file %s was evicted, clearing BackingStore", tempPath)
-						existingSff.store = nil
-					}
-				}
-			} else {
-				// Range-LRU mode - always valid (no temp file)
-				storeValid = true
+			// Check if temp file was evicted (TempFileManager sets evicted flag via callback)
+			if tempStore, ok := existingSff.store.(*fetcher.TempFileStore); ok && tempStore.IsEvicted() {
+				log.Printf("StageFile: File %s BackingStore was evicted, clearing for re-download", id)
+				existingSff.store = nil
 			}
 		}
+		storeValid := existingSff.store != nil
 		existingSff.storeMu.Unlock()
 		
 		atomic.StoreInt32(&existingSff.tileRef, 1)
@@ -402,7 +393,7 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 		if storeValid {
 			log.Printf("StageFile: File %s already staged with valid BackingStore, resetting tileRef=1 (reusing temp file)", id)
 		} else {
-			log.Printf("StageFile: File %s already staged but BackingStore invalid, resetting tileRef=1 (will re-download on next Open)", id)
+			log.Printf("StageFile: File %s already staged but BackingStore evicted, resetting tileRef=1 (will re-download on next Open)", id)
 		}
 		return existingSff.StagedFile, nil
 	}

@@ -30,6 +30,7 @@ type TempFileInfo struct {
 	Path        string
 	Size        int64
 	LastAccess  time.Time
+	OnEvict     func() // Optional callback when file is evicted
 }
 
 // TempFileManager manages temp files with LRU eviction and disk space limits
@@ -89,7 +90,7 @@ func (m *TempFileManager) CleanupStaleFiles() error {
 }
 
 // Register adds a temp file to the manager's tracking
-func (m *TempFileManager) Register(path string, size int64) {
+func (m *TempFileManager) Register(path string, size int64, onEvict func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	
@@ -97,6 +98,7 @@ func (m *TempFileManager) Register(path string, size int64) {
 		Path:       path,
 		Size:       size,
 		LastAccess: time.Now(),
+		OnEvict:    onEvict,
 	}
 	log.Printf("[tempfile] Registered temp file: %s (size=%d bytes)", path, size)
 }
@@ -238,6 +240,18 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 			break
 		}
 		
+		// Get the callback before deleting the file
+		m.mu.Lock()
+		info := m.files[entry.path]
+		onEvict := info.OnEvict
+		delete(m.files, entry.path)
+		m.mu.Unlock()
+		
+		// Call the callback BEFORE deleting file (without holding lock)
+		if onEvict != nil {
+			onEvict()
+		}
+		
 		// IMPORTANT: Do file deletion WITHOUT holding the lock
 		// This prevents blocking FUSE threads during I/O
 		if err := os.Remove(entry.path); err != nil {
@@ -247,11 +261,6 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 		
 		freedSpace += entry.size
 		evictedCount++
-		
-		// Only hold lock briefly to update the map
-		m.mu.Lock()
-		delete(m.files, entry.path)
-		m.mu.Unlock()
 		
 		log.Printf("[tempfile] Evicted temp file: %s (size=%d bytes, freed total=%d bytes)", 
 			entry.path, entry.size, freedSpace)
