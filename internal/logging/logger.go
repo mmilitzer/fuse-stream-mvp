@@ -180,16 +180,16 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 	// Also write to stdout immediately (non-blocking)
 	aw.logger.stdout.Write(data)
 
-	// Try to send to channel (non-blocking with timeout)
+	// Try to send to channel (truly non-blocking with default case)
 	msg := logMessage{data: data}
 	
 	select {
 	case aw.logger.logChan <- msg:
 		// Message queued successfully
-	case <-time.After(10 * time.Millisecond):
-		// Channel full or blocked - drop message to prevent deadlock
-		// This is intentional to ensure FUSE operations never block
-		fmt.Fprintf(os.Stderr, "[logging] Warning: log buffer full, dropping message\n")
+	default:
+		// Channel full - drop message immediately to prevent ANY blocking
+		// This is CRITICAL to ensure FUSE operations never stall
+		// The message was already written to stdout above, so it's not lost
 	}
 
 	return len(p), nil

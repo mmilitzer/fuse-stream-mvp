@@ -20,6 +20,7 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/appnap"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/sleep"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/winfsp/cgofuse/fuse"
@@ -463,14 +464,17 @@ func (fs *fuseFS) doEvictLocked(id string) {
 // FUSE operations
 
 func (fs *fuseFS) Init() {
+	defer logging.FUSETraceSimple("Init")()
 	log.Println("[FUSE] Filesystem initialized")
 }
 
 func (fs *fuseFS) Destroy() {
+	defer logging.FUSETraceSimple("Destroy")()
 	log.Println("[FUSE] Filesystem destroyed")
 }
 
 func (fs *fuseFS) Statfs(path string, stat *fuse.Statfs_t) int {
+	defer logging.FUSETraceSimple("Statfs")()
 	stat.Bsize = 4096
 	stat.Frsize = 4096
 	stat.Blocks = 1000000
@@ -484,6 +488,7 @@ func (fs *fuseFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *fuseFS) Access(path string, mask uint32) int {
+	defer logging.FUSETrace("Access", "path=%s mask=%d", path, mask)()
 	stat := &fuse.Stat_t{}
 	result := fs.Getattr(path, stat, 0)
 	if result != 0 {
@@ -496,6 +501,7 @@ func (fs *fuseFS) Access(path string, mask uint32) int {
 }
 
 func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	defer logging.FUSETrace("Getattr", "path=%s fh=%d", path, fh)()
 	path = strings.TrimPrefix(path, "/")
 	
 	// Set ownership to current user (prevents root ownership and admin:/// prompts)
@@ -553,6 +559,7 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 }
 
 func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+	defer logging.FUSETrace("Readdir", "path=%s ofst=%d fh=%d", path, ofst, fh)()
 	path = strings.TrimPrefix(path, "/")
 
 	// Root directory - show Staged/
@@ -599,6 +606,7 @@ func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 }
 
 func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
+	defer logging.FUSETrace("Open", "path=%s flags=%d", path, flags)()
 	path = strings.TrimPrefix(path, "/")
 	
 	// Check if it's a staged file
@@ -611,13 +619,23 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 			fs.mu.RUnlock()
 			
 			if exists && sf.FileName == parts[1] {
-				// Initialize BackingStore on first open
+				// Check if BackingStore needs initialization (without holding lock during I/O)
 				sf.storeMu.Lock()
-				if sf.store == nil {
+				needsInit := (sf.store == nil)
+				if needsInit {
+					log.Printf("Open: Backing store needs initialization for %s", sf.FileName)
+				}
+				sf.storeMu.Unlock()
+				
+				// If initialization is needed, do it WITHOUT holding the lock
+				if needsInit {
 					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
+					
+					// Build temp URL (network I/O - must not hold locks)
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
 						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
+						sf.storeMu.Lock()
 						sf.Status = "error"
 						sf.storeMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
@@ -642,42 +660,60 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 						storeOpts.CacheSize = 8
 					}
 
+					// Create backing store (may do I/O - must not hold locks)
 					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
 					if err != nil {
 						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
+						sf.storeMu.Lock()
 						sf.Status = "error"
 						sf.storeMu.Unlock()
 						return -fuse.EIO, ^uint64(0)
 					}
 
-					sf.store = store
-					sf.Status = "open"
-					log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
+					// Now atomically update the store (quick lock)
+					sf.storeMu.Lock()
+					if sf.store == nil {
+						// We won the race, use our store
+						sf.store = store
+						sf.Status = "open"
+						log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
+					} else {
+						// Someone else initialized it, close ours
+						store.Close()
+						log.Printf("Open: Backing store was initialized by another caller, discarding duplicate")
+					}
+					sf.storeMu.Unlock()
 				}
 				
-				// Increment both openRef (our tracking) and BackingStore refCount
+				// Increment refs and register file handle (hold locks briefly)
+				sf.storeMu.Lock()
+				if sf.store == nil {
+					sf.storeMu.Unlock()
+					return -fuse.EIO, ^uint64(0)
+				}
 				newOpenRef := atomic.AddInt32(&sf.openRef, 1)
 				sf.store.IncRef()
-				stagedID := sf.ID  // Capture ID before unlocking
+				stagedID := sf.ID
+				store := sf.store
 				sf.storeMu.Unlock()
 				
 				fs.fhMu.Lock()
 				fh := fs.nextFH
 				fs.nextFH++
-				fs.fhToStore[fh] = sf.store
+				fs.fhToStore[fh] = store
 				fs.fhToPath[fh] = path
-				fs.fhToStagedID[fh] = stagedID  // Store staged file ID for Release
+				fs.fhToStagedID[fh] = stagedID
 				isFirstHandle := len(fs.fhToStore) == 1
 				fs.fhMu.Unlock()
 				
-				// Enable sleep prevention on first file handle
+				// Enable sleep prevention on first file handle (async to avoid blocking)
 				if isFirstHandle {
-					fs.enableSleepPrevention()
+					go fs.enableSleepPrevention()
 				}
 				
 				tileRef := atomic.LoadInt32(&sf.tileRef)
 				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
-					sf.FileName, fh, tileRef, newOpenRef, sf.store.RefCount())
+					sf.FileName, fh, tileRef, newOpenRef, store.RefCount())
 				
 				return 0, fh
 			}
@@ -688,10 +724,11 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
-	// Get the backing store from the file handle
+	defer logging.FUSETrace("Read", "fh=%d off=%d len=%d", fh, ofst, len(buff))()
+	
+	// Get the backing store from the file handle (release lock immediately)
 	fs.fhMu.RLock()
 	store, exists := fs.fhToStore[fh]
-	filePath := fs.fhToPath[fh]
 	fs.fhMu.RUnlock()
 	
 	if !exists || store == nil {
@@ -699,37 +736,31 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 		return -fuse.EBADF
 	}
 
-	// Extract filename for logging
-	fileName := filepath.Base(filePath)
-	
-	log.Printf("Read: %s reading %d bytes at offset %d (fh=%d)", fileName, len(buff), ofst, fh)
+	// Perform the actual read (no locks held - this is I/O bound)
 	n, err := store.ReadAt(fs.ctx, buff, ofst)
 	
 	// Handle EOF correctly
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			log.Printf("Read: %s reached EOF at offset %d", fileName, ofst)
 			return 0
 		}
 		// For other errors, only fail if we read nothing
 		if n == 0 {
-			log.Printf("Read error for %s at offset %d: %v", fileName, ofst, err)
+			log.Printf("Read: I/O error at fh=%d off=%d: %v", fh, ofst, err)
 			return -fuse.EIO
 		}
-		// If we got some data despite error, return the data
-		log.Printf("Partial read for %s at offset %d: read %d bytes with error: %v", fileName, ofst, n, err)
-	} else {
-		log.Printf("Read: %s successfully read %d bytes at offset %d", fileName, n, ofst)
+		// If we got some data despite error, return the data (partial read)
 	}
 
 	return n
 }
 
 func (fs *fuseFS) Release(path string, fh uint64) int {
+	defer logging.FUSETrace("Release", "fh=%d", fh)()
+	
 	// Get and remove the file handle mapping
 	fs.fhMu.Lock()
 	store, exists := fs.fhToStore[fh]
-	filePath := fs.fhToPath[fh]
 	stagedID := fs.fhToStagedID[fh]
 	delete(fs.fhToStore, fh)
 	delete(fs.fhToPath, fh)
@@ -740,8 +771,6 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 		log.Printf("Release: Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
-
-	fileName := filepath.Base(filePath)
 	
 	// Decrement both BackingStore refCount and openRef
 	newStoreRefCount := store.DecRef()
@@ -754,8 +783,8 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	if sfExists {
 		newOpenRef := atomic.AddInt32(&sff.openRef, -1)
 		tileRef := atomic.LoadInt32(&sff.tileRef)
-		log.Printf("Release: %s closed (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
-			fileName, fh, tileRef, newOpenRef, newStoreRefCount)
+		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)", 
+			fh, tileRef, newOpenRef, newStoreRefCount)
 		
 		// If both refs are 0, try to evict
 		if tileRef == 0 && newOpenRef == 0 {
@@ -765,12 +794,12 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 			fs.mu.Unlock()
 		}
 	} else {
-		log.Printf("Release: %s closed (fh=%d, storeRefCount=%d) - staged file no longer exists", 
-			fileName, fh, newStoreRefCount)
+		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
+			fh, newStoreRefCount)
 	}
 	
-	// Disable sleep prevention if this was the last file handle
-	fs.disableSleepPrevention()
+	// Disable sleep prevention if this was the last file handle (async to avoid blocking)
+	go fs.disableSleepPrevention()
 
 	return 0
 }
