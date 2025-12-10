@@ -100,18 +100,31 @@ func Shutdown() {
 	}
 }
 
-// WaitForShutdown blocks until the daemon shutdown is complete.
+// WaitForShutdown blocks until the daemon shutdown is complete or times out.
 // This should be called after triggering shutdown (via context cancellation)
 // to ensure cleanup operations finish before the process exits.
-func WaitForShutdown() {
+// Returns true if shutdown completed, false if timed out.
+func WaitForShutdown() bool {
 	mu.Lock()
 	d := instance
 	mu.Unlock()
 	
-	if d != nil && d.shutdownComplete != nil {
-		log.Println("[daemon] Waiting for shutdown to complete...")
-		<-d.shutdownComplete
-		log.Println("[daemon] Shutdown wait complete")
+	if d == nil || d.shutdownComplete == nil {
+		return true // Nothing to wait for
+	}
+	
+	log.Println("[daemon] Waiting for shutdown to complete (max 5 seconds)...")
+	
+	// Wait for shutdown with a timeout to prevent hanging indefinitely
+	// if filesystem unmount blocks for some reason
+	select {
+	case <-d.shutdownComplete:
+		log.Println("[daemon] Shutdown completed successfully")
+		return true
+	case <-time.After(5 * time.Second):
+		log.Println("[daemon] WARNING: Shutdown timed out after 5 seconds - exiting anyway")
+		log.Println("[daemon] Temp files should still be cleaned, OS will force unmount if needed")
+		return false
 	}
 }
 
