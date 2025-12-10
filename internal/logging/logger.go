@@ -1,5 +1,8 @@
 // Package logging provides persistent file logging for diagnosing issues
 // when the app is launched from Finder without console access.
+// 
+// This logger uses an async, non-blocking design to prevent deadlocks when
+// called from FUSE operations or other performance-critical code paths.
 package logging
 
 import (
@@ -13,8 +16,9 @@ import (
 )
 
 const (
-	maxLogFileSize = 10 * 1024 * 1024 // 10MB
-	maxLogFiles    = 5                // Keep 5 rotated log files
+	maxLogFileSize   = 10 * 1024 * 1024 // 10MB
+	maxLogFiles      = 5                // Keep 5 rotated log files
+	logChannelBuffer = 1000             // Buffer up to 1000 log messages
 )
 
 var (
@@ -22,13 +26,22 @@ var (
 	mu           sync.Mutex
 )
 
+// logMessage represents a single log message to be written asynchronously.
+type logMessage struct {
+	data []byte
+}
+
 // FileLogger handles persistent logging to a file with rotation.
+// It uses an asynchronous write model to prevent blocking FUSE operations.
 type FileLogger struct {
-	logPath  string
-	file     *os.File
-	mu       sync.Mutex
-	size     int64
-	multiOut io.Writer // Writes to both file and stdout
+	logPath   string
+	file      *os.File
+	mu        sync.Mutex
+	size      int64
+	logChan   chan logMessage
+	done      chan struct{}
+	wg        sync.WaitGroup
+	stdout    io.Writer // Reference to stdout for direct writes
 }
 
 // Init initializes the global file logger.
@@ -60,16 +73,23 @@ func Init(logDir string) error {
 
 	logger := &FileLogger{
 		logPath: logPath,
+		logChan: make(chan logMessage, logChannelBuffer),
+		done:    make(chan struct{}),
+		stdout:  os.Stdout,
 	}
 
 	if err := logger.openLogFile(); err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
+	// Start async writer goroutine
+	logger.wg.Add(1)
+	go logger.writerLoop()
+
 	globalLogger = logger
 
-	// Redirect Go's standard logger to use both file and stdout
-	log.SetOutput(logger.multiOut)
+	// Redirect Go's standard logger to use async writer
+	log.SetOutput(&asyncWriter{logger: logger})
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
 	log.Printf("[logging] File logging initialized at: %s", logPath)
@@ -77,7 +97,7 @@ func Init(logDir string) error {
 	return nil
 }
 
-// Close closes the log file.
+// Close closes the log file and stops the async writer.
 func Close() error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -86,22 +106,31 @@ func Close() error {
 		return nil
 	}
 
-	globalLogger.mu.Lock()
-	defer globalLogger.mu.Unlock()
+	log.Printf("[logging] Closing log file")
 
+	// Signal writer to stop
+	close(globalLogger.done)
+	
+	// Wait for writer to finish processing remaining messages
+	globalLogger.wg.Wait()
+
+	globalLogger.mu.Lock()
 	if globalLogger.file != nil {
-		log.Printf("[logging] Closing log file")
-		if err := globalLogger.file.Close(); err != nil {
+		err := globalLogger.file.Close()
+		globalLogger.file = nil
+		globalLogger.mu.Unlock()
+		if err != nil {
 			return err
 		}
-		globalLogger.file = nil
+	} else {
+		globalLogger.mu.Unlock()
 	}
 
 	globalLogger = nil
 	return nil
 }
 
-// openLogFile opens (or creates) the log file and sets up multi-writer.
+// openLogFile opens (or creates) the log file.
 func (l *FileLogger) openLogFile() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -134,44 +163,85 @@ func (l *FileLogger) openLogFile() error {
 
 	l.file = file
 
-	// Create multi-writer that writes to both file and stdout
-	l.multiOut = io.MultiWriter(os.Stdout, &trackingWriter{logger: l})
-
 	return nil
 }
 
-// trackingWriter wraps the file writer and tracks bytes written for rotation.
-type trackingWriter struct {
+// asyncWriter implements io.Writer and sends log messages to the async channel.
+// This prevents blocking FUSE operations when logging.
+type asyncWriter struct {
 	logger *FileLogger
 }
 
-func (tw *trackingWriter) Write(p []byte) (n int, err error) {
-	tw.logger.mu.Lock()
-	defer tw.logger.mu.Unlock()
+func (aw *asyncWriter) Write(p []byte) (n int, err error) {
+	// Make a copy of the data since p's backing array may be reused
+	data := make([]byte, len(p))
+	copy(data, p)
 
-	if tw.logger.file == nil {
-		return 0, fmt.Errorf("log file not open")
+	// Also write to stdout immediately (non-blocking)
+	aw.logger.stdout.Write(data)
+
+	// Try to send to channel (non-blocking with timeout)
+	msg := logMessage{data: data}
+	
+	select {
+	case aw.logger.logChan <- msg:
+		// Message queued successfully
+	case <-time.After(10 * time.Millisecond):
+		// Channel full or blocked - drop message to prevent deadlock
+		// This is intentional to ensure FUSE operations never block
+		fmt.Fprintf(os.Stderr, "[logging] Warning: log buffer full, dropping message\n")
 	}
 
-	n, err = tw.logger.file.Write(p)
-	if err != nil {
-		return n, err
-	}
+	return len(p), nil
+}
 
-	tw.logger.size += int64(n)
+// writerLoop is the async goroutine that writes log messages to the file.
+func (l *FileLogger) writerLoop() {
+	defer l.wg.Done()
 
-	// Check if we need to rotate
-	if tw.logger.size >= maxLogFileSize {
-		if rotateErr := tw.logger.rotateLogsLocked(); rotateErr != nil {
-			// Log rotation failed, but we already wrote the data
-			// Just print to stderr and continue
-			fmt.Fprintf(os.Stderr, "Failed to rotate logs: %v\n", rotateErr)
-		} else {
-			tw.logger.size = 0
+	for {
+		select {
+		case msg := <-l.logChan:
+			l.writeToFile(msg.data)
+		case <-l.done:
+			// Drain remaining messages before stopping
+			for {
+				select {
+				case msg := <-l.logChan:
+					l.writeToFile(msg.data)
+				default:
+					return
+				}
+			}
 		}
 	}
+}
 
-	return n, nil
+// writeToFile writes data to the log file (called from writer goroutine only).
+func (l *FileLogger) writeToFile(data []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.file == nil {
+		return
+	}
+
+	n, err := l.file.Write(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[logging] Error writing to log file: %v\n", err)
+		return
+	}
+
+	l.size += int64(n)
+
+	// Check if we need to rotate
+	if l.size >= maxLogFileSize {
+		if rotateErr := l.rotateLogsLocked(); rotateErr != nil {
+			fmt.Fprintf(os.Stderr, "[logging] Failed to rotate logs: %v\n", rotateErr)
+		} else {
+			l.size = 0
+		}
+	}
 }
 
 // rotateLogsLocked rotates log files (must be called with lock held).
