@@ -164,30 +164,34 @@ func (m *TempFileManager) CheckSpaceAvailable(fileSize int64) (bool, error) {
 
 // EnsureSpaceAvailable ensures there's enough space for a file of the given size
 // by evicting old temp files if necessary. Returns error if space cannot be freed.
+// IMPORTANT: This function minimizes lock holding time to avoid blocking FUSE threads.
 func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
+	// Quick check without holding lock for long
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	fileCount := len(m.files)
+	m.mu.Unlock()
 	
-	// First check if we need to do anything
+	// Check disk space without holding lock (statfs can be slow)
 	spaceOK, err := m.CheckSpaceAvailable(fileSize)
 	if err != nil {
 		return err
 	}
 	
-	if spaceOK && len(m.files) < MaxTempFiles {
-		log.Printf("[tempfile] Space check OK: %d files, space available for %d bytes", len(m.files), fileSize)
+	if spaceOK && fileCount < MaxTempFiles {
+		log.Printf("[tempfile] Space check OK: %d files, space available for %d bytes", fileCount, fileSize)
 		return nil
 	}
 	
-	log.Printf("[tempfile] Need to free space or reduce file count (current files=%d, max=%d)", len(m.files), MaxTempFiles)
+	log.Printf("[tempfile] Need to free space or reduce file count (current files=%d, max=%d)", fileCount, MaxTempFiles)
 	
-	// Build a list of temp files sorted by last access time (oldest first)
+	// Build a list of temp files to evict - hold lock only briefly
 	type fileEntry struct {
 		path       string
 		size       int64
 		lastAccess time.Time
 	}
 	
+	m.mu.Lock()
 	var entries []fileEntry
 	for path, info := range m.files {
 		entries = append(entries, fileEntry{
@@ -196,7 +200,9 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 			lastAccess: info.LastAccess,
 		})
 	}
+	m.mu.Unlock()
 	
+	// Sort outside the lock
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].lastAccess.Before(entries[j].lastAccess)
 	})
@@ -206,17 +212,22 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 	evictedCount := 0
 	
 	for _, entry := range entries {
-		// Stop if we've freed enough space and are under the file limit
+		// Check if we've freed enough space - without lock
 		spaceOK, err := m.CheckSpaceAvailable(fileSize)
 		if err != nil {
 			return err
 		}
 		
-		if spaceOK && (len(m.files)-evictedCount) < MaxTempFiles {
+		m.mu.Lock()
+		currentFileCount := len(m.files)
+		m.mu.Unlock()
+		
+		if spaceOK && currentFileCount < MaxTempFiles {
 			break
 		}
 		
-		// Try to delete the file
+		// IMPORTANT: Do file deletion WITHOUT holding the lock
+		// This prevents blocking FUSE threads during I/O
 		if err := os.Remove(entry.path); err != nil {
 			log.Printf("[tempfile] Warning: failed to evict temp file %s: %v", entry.path, err)
 			continue
@@ -224,7 +235,12 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 		
 		freedSpace += entry.size
 		evictedCount++
+		
+		// Only hold lock briefly to update the map
+		m.mu.Lock()
 		delete(m.files, entry.path)
+		m.mu.Unlock()
+		
 		log.Printf("[tempfile] Evicted temp file: %s (size=%d bytes, freed total=%d bytes)", 
 			entry.path, entry.size, freedSpace)
 	}
@@ -235,6 +251,10 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 		return err
 	}
 	
+	m.mu.Lock()
+	finalFileCount := len(m.files)
+	m.mu.Unlock()
+	
 	if !spaceOK {
 		total, available, _ := m.GetDiskUsage()
 		return fmt.Errorf("insufficient disk space: need %d MB, have %d MB available (total=%d MB, 70%% limit=%d MB)", 
@@ -244,8 +264,8 @@ func (m *TempFileManager) EnsureSpaceAvailable(fileSize int64) error {
 			(total*MaxDiskUsagePercent/100)/(1024*1024))
 	}
 	
-	if len(m.files) >= MaxTempFiles {
-		return fmt.Errorf("too many temp files: %d (max=%d)", len(m.files), MaxTempFiles)
+	if finalFileCount >= MaxTempFiles {
+		return fmt.Errorf("too many temp files: %d (max=%d)", finalFileCount, MaxTempFiles)
 	}
 	
 	log.Printf("[tempfile] Space ensured: evicted %d files, freed %d bytes", evictedCount, freedSpace)
