@@ -184,6 +184,11 @@ func (s *TempFileStore) RefCount() int32 {
 	return s.refCount.Load()
 }
 
+// TempPath returns the path to the temporary file.
+func (s *TempFileStore) TempPath() string {
+	return s.tempPath
+}
+
 // Close releases resources and deletes the temp file.
 func (s *TempFileStore) Close() error {
 	if s.closed.Swap(true) {
