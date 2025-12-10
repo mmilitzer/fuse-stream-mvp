@@ -16,11 +16,19 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/frontend"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/api"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/daemon"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/mmilitzer/fuse-stream-mvp/ui"
 )
 
 func main() {
+	// Initialize file logging first so we can diagnose Finder-launch issues
+	if err := logging.Init(""); err != nil {
+		log.Printf("Warning: Failed to initialize file logging: %v", err)
+		// Continue anyway - we'll just use stdout/stderr
+	}
+	defer logging.Close()
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
