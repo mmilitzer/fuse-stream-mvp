@@ -662,12 +662,8 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				if needsInit {
 					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
 
-					// CRITICAL: Use timeout-bounded context for network operations
-					// BuildTempURL and NewBackingStore can do HTTP requests which may stall
-					ctx, cancel := context.WithTimeout(fs.ctx, 30*time.Second)
-					defer cancel()
-
 					// Build temp URL (network I/O - must not hold locks)
+					// Note: BuildTempURL is typically fast (just builds a URL), so no timeout needed
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
 						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
@@ -696,15 +692,13 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 						storeOpts.CacheSize = 8
 					}
 
-					// Create backing store (may do I/O - must not hold locks)
-					// This can do HTTP HEAD requests to verify Range support
-					store, err := fetcher.NewBackingStore(ctx, tempURL, sf.Size, storeOpts)
+					// CRITICAL: Use fs.ctx (NOT a timeout context) for BackingStore
+					// The BackingStore spawns long-running goroutines (e.g., TempFileStore downloader)
+					// that need to run until the store is closed, not just during Open()
+					// The timeout protection happens in Read() where each read has a 15-second timeout
+					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
 					if err != nil {
-						if errors.Is(err, context.DeadlineExceeded) {
-							log.Printf("Failed to create backing store for %s: timeout after 30s", sf.FileName)
-						} else {
-							log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
-						}
+						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
 						sf.storeMu.Lock()
 						sf.Status = "error"
 						sf.storeMu.Unlock()

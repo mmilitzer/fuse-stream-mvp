@@ -68,7 +68,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 - Fixed EOF bug: return `n` when `n>0 && err==io.EOF`
 - Better error logging distinguishes timeouts from other I/O errors
 
-### 2. Timeout-Bounded Contexts in Open() (30 seconds)
+### 2. Open() Callback - No Timeout Context for BackingStore
 
 **File**: `internal/fs/fs_fuse.go`
 
@@ -76,30 +76,26 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
     // ...
     if needsInit {
-        // CRITICAL: Use timeout-bounded context for network operations
-        ctx, cancel := context.WithTimeout(fs.ctx, 30*time.Second)
-        defer cancel()
-        
+        // Build temp URL (typically fast, just builds a URL)
         tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
         // ...
         
-        // This can do HTTP HEAD requests to verify Range support
-        store, err := fetcher.NewBackingStore(ctx, tempURL, sf.Size, storeOpts)
-        if err != nil {
-            if errors.Is(err, context.DeadlineExceeded) {
-                log.Printf("Failed to create backing store: timeout after 30s")
-            }
-            // ...
-        }
+        // CRITICAL: Use fs.ctx (NOT a timeout context) for BackingStore
+        // The BackingStore spawns long-running goroutines (e.g., TempFileStore downloader)
+        // that need to run until the store is closed, not just during Open()
+        // The timeout protection happens in Read() where each read has a 15-second timeout
+        store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
+        // ...
     }
     // ...
 }
 ```
 
 **Changes**:
-- Each Open call that initializes a backing store gets a 30-second timeout
-- BuildTempURL and NewBackingStore operations are time-bounded
-- Better error logging for timeout conditions
+- Open() does NOT use a timeout context for BackingStore creation
+- The BackingStore needs a long-lived context because it spawns background goroutines (like TempFileStore's downloader)
+- Timeout protection is provided by Read()'s 15-second timeout instead
+- BuildTempURL is typically fast (just builds a URL string), so no timeout needed
 
 ### 3. Improved TempFileStore Context Handling
 
@@ -170,12 +166,30 @@ The RangeLRUStore already properly handles context cancellation:
 
 No changes needed.
 
+## Important Architecture Note
+
+**Why Open() doesn't use a timeout context:**
+
+The BackingStore (especially TempFileStore) spawns long-running background goroutines that download data continuously. These goroutines need to run for the lifetime of the store, not just during the Open() call.
+
+If we pass a timeout context to `NewBackingStore()`:
+1. The context gets stored in the BackingStore
+2. The background downloader goroutine uses this context
+3. When Open() returns, `defer cancel()` cancels the context
+4. The downloader immediately fails with "context canceled"
+5. All subsequent reads fail
+
+Instead:
+- **BackingStore uses `fs.ctx`**: Long-lived, cancelled only on filesystem shutdown
+- **Read() uses timeout context**: Each individual read is time-bounded (15 seconds)
+- **Result**: Downloads continue in background, but reads can't hang forever
+
 ## Technical Details
 
 ### Why These Timeouts?
 
-- **Read: 15 seconds**: Individual read operations should be fast. 15 seconds allows for slow network but prevents indefinite hangs.
-- **Open: 30 seconds**: Initialization can involve HEAD requests and temp file setup. 30 seconds is generous but still bounded.
+- **Read: 15 seconds**: Individual read operations should be fast. 15 seconds allows for slow network but prevents indefinite hangs. This is the ONLY timeout needed - it protects against stalled downloads while allowing normal operations to proceed.
+- **Open: No timeout**: The BackingStore initialization uses `fs.ctx` (not a timeout context) because it spawns long-running background goroutines that need to persist beyond the Open() call. Protection against hangs comes from Read()'s timeout instead.
 
 ### EOF Handling Correctness
 
