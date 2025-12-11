@@ -68,10 +68,12 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 }
 
 // downloader runs in a goroutine and downloads the file sequentially.
+// CRITICAL: This method does file I/O and network I/O - it must NOT hold any locks
+// across these operations. Only lock briefly to update shared state.
 func (s *TempFileStore) downloader(ctx context.Context) {
 	defer s.wg.Done()
 
-	// Open temp file for writing
+	// Open temp file for writing - no locks needed, this is private to downloader
 	f, err := os.OpenFile(s.tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		s.setError(fmt.Errorf("open temp file: %w", err))
@@ -79,14 +81,14 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 	}
 	defer f.Close()
 
-	// Create HTTP request
+	// Create HTTP request - no locks needed
 	req, err := http.NewRequestWithContext(ctx, "GET", s.url, nil)
 	if err != nil {
 		s.setError(fmt.Errorf("create request: %w", err))
 		return
 	}
 
-	// Execute request
+	// Execute request - no locks needed
 	resp, err := s.client.Do(req)
 	if err != nil {
 		s.setError(fmt.Errorf("http request: %w", err))
@@ -111,8 +113,10 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 		default:
 		}
 
+		// Read from network - no locks held
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			// Write to file - no locks held during I/O
 			written, writeErr := f.Write(buf[:n])
 			if writeErr != nil {
 				s.setError(fmt.Errorf("write to temp file: %w", writeErr))
@@ -120,8 +124,9 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 			}
 			totalWritten += int64(written)
 
-			// Update progress and notify waiters
+			// Update progress atomically (no lock needed for atomic operation)
 			s.downloaded.Store(totalWritten)
+			// Notify waiters - this is a quick operation, safe to call
 			s.cond.Broadcast()
 		}
 
@@ -191,6 +196,8 @@ func (s *TempFileStore) Close() error {
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
+// CRITICAL: This method must NEVER hold a mutex across I/O operations to avoid deadlocks.
+// We use a timeout-based wait to prevent indefinite blocking.
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off >= s.size {
 		return 0, io.EOF
@@ -204,11 +211,16 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 
 	// Wait until desired region is downloaded or an error/ctx cancel
-	s.cond.L.Lock()
+	// Use timeout-based wait to prevent indefinite blocking (max 10 seconds per iteration)
+	const maxWaitPerIteration = 10 * time.Second
+	waitDeadline := time.Now().Add(maxWaitPerIteration)
+	
 	for {
+		// Lock only to read state - unlock before any I/O or long waits
+		s.cond.L.Lock()
 		downloaded := s.downloaded.Load()
 		err := s.getError()
-
+		
 		// If we have enough data, proceed
 		if downloaded >= wantEnd {
 			s.cond.L.Unlock()
@@ -227,11 +239,29 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 			return 0, ctx.Err()
 		}
 
-		// Wait for more data
+		// Check timeout to prevent indefinite waiting
+		if time.Now().After(waitDeadline) {
+			s.cond.L.Unlock()
+			return 0, fmt.Errorf("timeout waiting for data at offset %d (have %d, need %d)", off, downloaded, wantEnd)
+		}
+
+		// Wait for more data with a timeout using a goroutine + channel
+		// This allows us to wake up periodically to check context and timeout
+		waitDone := make(chan struct{})
+		go func() {
+			time.Sleep(100 * time.Millisecond) // Wake up every 100ms to recheck
+			s.cond.Broadcast()
+			close(waitDone)
+		}()
+		
 		s.cond.Wait()
+		s.cond.L.Unlock()
+		
+		// Wait for our timeout goroutine to finish
+		<-waitDone
 	}
 
-	// Read from temp file
+	// Read from temp file - NO LOCKS HELD during I/O
 	f, err := os.Open(s.tempPath)
 	if err != nil {
 		return 0, fmt.Errorf("open temp file: %w", err)

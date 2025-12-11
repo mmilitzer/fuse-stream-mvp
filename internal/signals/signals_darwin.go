@@ -48,3 +48,23 @@ func SetupSignalHandler(onInterrupt func()) {
 	
 	log.Println("[signals] Signal handler installed (SIGTERM will trigger NSApp terminate, SIGINT will call handler)")
 }
+
+// SetupDebugSignalHandler sets up SIGQUIT handler for on-demand debugging.
+// SIGQUIT (kill -QUIT <pid> or Ctrl+\) triggers a goroutine stack dump.
+func SetupDebugSignalHandler(onQuit func()) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGQUIT)
+	
+	go func() {
+		for sig := range sigChan {
+			if sig == syscall.SIGQUIT {
+				log.Println("[signals] Received SIGQUIT - dumping goroutine stacks")
+				if onQuit != nil {
+					onQuit()
+				}
+			}
+		}
+	}()
+	
+	log.Println("[signals] Debug signal handler installed (SIGQUIT will dump stacks)")
+}

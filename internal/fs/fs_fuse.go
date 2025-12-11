@@ -21,6 +21,7 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/internal/appnap"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/signals"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/sleep"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/winfsp/cgofuse/fuse"
@@ -66,10 +67,18 @@ type fuseFS struct {
 	// App Nap prevention (NSProcessInfo activity - prevents process throttling)
 	appNapRelease func()
 	appNapMu      sync.Mutex
+	
+	// Watchdog for detecting stalled FUSE operations
+	watchdog *watchdog
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
 	ctx, cancel := context.WithCancel(context.Background())
+	
+	// Initialize watchdog for FUSE operation monitoring
+	// Log directory will be created in ~/Library/Logs/FuseStream (macOS) or ~/.local/share/FuseStream (Linux)
+	wd := newWatchdog("")
+	
 	return &fuseFS{
 		client:       client,
 		config:       cfg,
@@ -80,11 +89,20 @@ func newFS(client *api.Client, cfg *config.Config) FS {
 		nextFH:       1,
 		ctx:          ctx,
 		cancel:       cancel,
+		watchdog:     wd,
 	}
 }
 
 func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
+	
+	// Start watchdog for FUSE operation monitoring
+	fs.watchdog.start()
+	
+	// Setup SIGQUIT handler for on-demand stack dumps
+	signals.SetupDebugSignalHandler(func() {
+		fs.watchdog.dumpStacks()
+	})
 	
 	// Attempt mount recovery on macOS
 	if runtime.GOOS == "darwin" {
@@ -97,6 +115,7 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.host = fuse.NewFileSystemHost(fs)
 	
 	// Mount options (OS-specific)
+	// CRITICAL: Do NOT use -s (single-threaded) or -o singlethread - we need parallel FUSE
 	mountOpts := []string{
 		"-o", "ro",
 		"-o", "fsname=fusestream",
@@ -116,6 +135,10 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 		// If you need allow_other, it requires user_allow_other in /etc/fuse.conf
 		// and can be gated by a config option in the future
 	}
+	
+	// Log mount options to verify we're not in single-threaded mode
+	log.Printf("[fs] Mount options: %v", mountOpts)
+	log.Printf("[fs] IMPORTANT: Verify NO -s or -o singlethread in mount options (parallel mode required)")
 
 	// Mount the filesystem
 	// Note: host.Mount() is a blocking call that runs the FUSE event loop.
@@ -245,6 +268,11 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 }
 
 func (fs *fuseFS) Stop() error {
+	// Stop watchdog
+	if fs.watchdog != nil {
+		fs.watchdog.stop()
+	}
+	
 	// Evict all staged files to clean up BackingStores
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("[fs] Error evicting staged files: %v", err)
@@ -501,6 +529,7 @@ func (fs *fuseFS) Access(path string, mask uint32) int {
 }
 
 func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	defer fs.watchdog.enter("Getattr")()
 	defer logging.FUSETrace("Getattr", "path=%s fh=%d", path, fh)()
 	path = strings.TrimPrefix(path, "/")
 	
@@ -559,6 +588,7 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 }
 
 func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+	defer fs.watchdog.enter("Readdir")()
 	defer logging.FUSETrace("Readdir", "path=%s ofst=%d fh=%d", path, ofst, fh)()
 	path = strings.TrimPrefix(path, "/")
 
@@ -606,6 +636,7 @@ func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 }
 
 func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
+	defer fs.watchdog.enter("Open")()
 	defer logging.FUSETrace("Open", "path=%s flags=%d", path, flags)()
 	path = strings.TrimPrefix(path, "/")
 	
@@ -724,6 +755,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	defer fs.watchdog.enter("Read")()
 	defer logging.FUSETrace("Read", "fh=%d off=%d len=%d", fh, ofst, len(buff))()
 	
 	// Get the backing store from the file handle (release lock immediately)
@@ -756,6 +788,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *fuseFS) Release(path string, fh uint64) int {
+	defer fs.watchdog.enter("Release")()
 	defer logging.FUSETrace("Release", "fh=%d", fh)()
 	
 	// Get and remove the file handle mapping
