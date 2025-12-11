@@ -211,16 +211,19 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 
 	// Wait until desired region is downloaded or an error/ctx cancel
-	// Use timeout-based wait to prevent indefinite blocking (max 10 seconds per iteration)
-	const maxWaitPerIteration = 10 * time.Second
-	waitDeadline := time.Now().Add(maxWaitPerIteration)
-	
+	// CRITICAL: Context timeout is the ONLY timeout we respect (no internal timeout)
+	// This ensures the FUSE callback's timeout controls the maximum wait time
 	for {
+		// Check context FIRST before acquiring any locks
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
 		// Lock only to read state - unlock before any I/O or long waits
 		s.cond.L.Lock()
 		downloaded := s.downloaded.Load()
 		err := s.getError()
-		
+
 		// If we have enough data, proceed
 		if downloaded >= wantEnd {
 			s.cond.L.Unlock()
@@ -233,30 +236,23 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 			return 0, err
 		}
 
-		// Check context
-		if ctx.Err() != nil {
-			s.cond.L.Unlock()
-			return 0, ctx.Err()
-		}
-
-		// Check timeout to prevent indefinite waiting
-		if time.Now().After(waitDeadline) {
-			s.cond.L.Unlock()
-			return 0, fmt.Errorf("timeout waiting for data at offset %d (have %d, need %d)", off, downloaded, wantEnd)
-		}
-
-		// Wait for more data with a timeout using a goroutine + channel
-		// This allows us to wake up periodically to check context and timeout
+		// Wait for more data with a timeout goroutine that respects context
+		// This wakes us up periodically to check context cancellation
 		waitDone := make(chan struct{})
 		go func() {
-			time.Sleep(100 * time.Millisecond) // Wake up every 100ms to recheck
-			s.cond.Broadcast()
+			select {
+			case <-time.After(100 * time.Millisecond): // Wake up every 100ms to recheck context
+				s.cond.Broadcast()
+			case <-ctx.Done():
+				// Context cancelled, wake up immediately
+				s.cond.Broadcast()
+			}
 			close(waitDone)
 		}()
-		
+
 		s.cond.Wait()
 		s.cond.L.Unlock()
-		
+
 		// Wait for our timeout goroutine to finish
 		<-waitDone
 	}
