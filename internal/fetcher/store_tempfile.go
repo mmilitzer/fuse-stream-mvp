@@ -22,7 +22,13 @@ type TempFileStore struct {
 	downloaded atomic.Int64
 	err        error
 	errMu      sync.RWMutex
-	cond       *sync.Cond
+	
+	// Progress notification channel - closed when download finishes or errors
+	progressCh chan struct{}
+	
+	// Cached file handle for reads (reduces syscall overhead)
+	readFile   *os.File
+	readFileMu sync.RWMutex
 
 	// Reference counting and lifecycle
 	refCount atomic.Int32
@@ -49,16 +55,24 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 	tempPath := tempFile.Name()
 	tempFile.Close() // We'll reopen for writing in the downloader
 
+	// Open file for reading and cache the handle
+	readFile, err := os.Open(tempPath)
+	if err != nil {
+		os.Remove(tempPath)
+		return nil, fmt.Errorf("open temp file for reading: %w", err)
+	}
+
 	// Create store
 	ctx, cancel := context.WithCancel(ctx)
 	store := &TempFileStore{
-		url:      url,
-		size:     size,
-		tempPath: tempPath,
-		client:   &http.Client{Timeout: 5 * time.Minute},
-		cancel:   cancel,
+		url:        url,
+		size:       size,
+		tempPath:   tempPath,
+		client:     &http.Client{Timeout: 5 * time.Minute},
+		cancel:     cancel,
+		progressCh: make(chan struct{}),
+		readFile:   readFile,
 	}
-	store.cond = sync.NewCond(&sync.Mutex{})
 
 	// Start downloader goroutine
 	store.wg.Add(1)
@@ -72,6 +86,7 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 // across these operations. Only lock briefly to update shared state.
 func (s *TempFileStore) downloader(ctx context.Context) {
 	defer s.wg.Done()
+	defer close(s.progressCh) // Signal completion to all waiters
 
 	// Open temp file for writing - no locks needed, this is private to downloader
 	f, err := os.OpenFile(s.tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -126,15 +141,20 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 
 			// Update progress atomically (no lock needed for atomic operation)
 			s.downloaded.Store(totalWritten)
-			// Notify waiters - this is a quick operation, safe to call
-			s.cond.Broadcast()
+			
+			// Signal progress on channel - non-blocking send
+			// Readers use this to wake up and recheck progress
+			select {
+			case s.progressCh <- struct{}{}:
+			default:
+				// Channel full or no readers, that's fine
+			}
 		}
 
 		if readErr != nil {
 			if readErr == io.EOF {
 				// Success!
 				s.downloaded.Store(s.size)
-				s.cond.Broadcast()
 				return
 			}
 			s.setError(fmt.Errorf("read from response: %w", readErr))
@@ -143,12 +163,11 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 	}
 }
 
-// setError sets the error state and notifies waiters.
+// setError sets the error state.
 func (s *TempFileStore) setError(err error) {
 	s.errMu.Lock()
 	s.err = err
 	s.errMu.Unlock()
-	s.cond.Broadcast()
 }
 
 // getError returns the current error state.
@@ -186,18 +205,25 @@ func (s *TempFileStore) Close() error {
 
 	// Cancel downloader
 	s.cancel()
-	s.cond.Broadcast()
 
 	// Wait for downloader to finish
 	s.wg.Wait()
+
+	// Close cached read file handle
+	s.readFileMu.Lock()
+	if s.readFile != nil {
+		s.readFile.Close()
+		s.readFile = nil
+	}
+	s.readFileMu.Unlock()
 
 	// Remove temp file
 	return os.Remove(s.tempPath)
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
-// CRITICAL: This method must NEVER hold a mutex across I/O operations to avoid deadlocks.
-// We use a timeout-based wait to prevent indefinite blocking.
+// CRITICAL: Uses channel-based signaling instead of sync.Cond to avoid missed-wakeup races.
+// The downloader closes progressCh when finished, ensuring no reader can miss the signal.
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off >= s.size {
 		return 0, io.EOF
@@ -210,59 +236,44 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 		p = p[:s.size-off]
 	}
 
-	// Wait until desired region is downloaded or an error/ctx cancel
-	// CRITICAL: Context timeout is the ONLY timeout we respect (no internal timeout)
-	// This ensures the FUSE callback's timeout controls the maximum wait time
+	// Wait until desired region is downloaded or an error/ctx cancel occurs
+	// Use channel-based signaling to avoid missed-wakeup races with sync.Cond
 	for {
-		// Check context FIRST before acquiring any locks
+		// Check if we have enough data
+		downloaded := s.downloaded.Load()
+		if downloaded >= wantEnd {
+			break
+		}
+
+		// Check for errors
+		if err := s.getError(); err != nil {
+			return 0, err
+		}
+
+		// Check context cancellation
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
 
-		// Lock only to read state - unlock before any I/O or long waits
-		s.cond.L.Lock()
-		downloaded := s.downloaded.Load()
-		err := s.getError()
-
-		// If we have enough data, proceed
-		if downloaded >= wantEnd {
-			s.cond.L.Unlock()
-			break
+		// Wait for progress signal or context cancellation
+		// The downloader sends on progressCh after each chunk write and closes it when done
+		// Closing the channel ensures all readers wake up (no missed signals)
+		select {
+		case <-s.progressCh:
+			// Progress signal received (or channel closed), loop to recheck
+		case <-ctx.Done():
+			return 0, ctx.Err()
 		}
-
-		// If there's an error and we don't have enough data, fail
-		if err != nil {
-			s.cond.L.Unlock()
-			return 0, err
-		}
-
-		// Wait for more data with a timeout goroutine that respects context
-		// This wakes us up periodically to check context cancellation
-		waitDone := make(chan struct{})
-		go func() {
-			select {
-			case <-time.After(100 * time.Millisecond): // Wake up every 100ms to recheck context
-				s.cond.Broadcast()
-			case <-ctx.Done():
-				// Context cancelled, wake up immediately
-				s.cond.Broadcast()
-			}
-			close(waitDone)
-		}()
-
-		s.cond.Wait()
-		s.cond.L.Unlock()
-
-		// Wait for our timeout goroutine to finish
-		<-waitDone
 	}
 
-	// Read from temp file - NO LOCKS HELD during I/O
-	f, err := os.Open(s.tempPath)
-	if err != nil {
-		return 0, fmt.Errorf("open temp file: %w", err)
+	// Read from cached temp file handle - NO LOCKS HELD during I/O
+	s.readFileMu.RLock()
+	f := s.readFile
+	s.readFileMu.RUnlock()
+
+	if f == nil {
+		return 0, fmt.Errorf("temp file closed")
 	}
-	defer f.Close()
 
 	n, err := f.ReadAt(p, off)
 	if err != nil {
