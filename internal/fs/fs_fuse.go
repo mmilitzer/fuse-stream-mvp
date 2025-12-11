@@ -808,15 +808,15 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				
 				if store == nil {
 					// Store not ready - this should not happen if StageFile() was called properly
-					// Return EAGAIN to let the caller retry
+					// Return EIO (I/O error) since the file was not properly prepared
 					logging.FUSELog("[Open] ERROR: Backing store not ready for %s - file not properly staged", sf.FileName)
-					return -fuse.EAGAIN, ^uint64(0)
+					return -fuse.EIO, ^uint64(0)
 				}
 				
 				// Check if store was evicted
 				if tempStore, ok := store.(*fetcher.TempFileStore); ok && tempStore.IsEvicted() {
 					logging.FUSELog("[Open] ERROR: Backing store was evicted for %s - file needs re-staging", sf.FileName)
-					return -fuse.ESTALE, ^uint64(0)
+					return -fuse.EIO, ^uint64(0)
 				}
 				
 				// Increment refs and register file handle (hold locks briefly)
