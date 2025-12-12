@@ -38,15 +38,22 @@ type TempFileStore struct {
 	// notifyCh receives periodic progress updates
 	notifyCh   chan struct{}
 	
-	// Cached file handle for reads (reduces syscall overhead)
-	readFile   *os.File
-	readFileMu sync.RWMutex
+	// Shared file handle for concurrent reads
+	// The file is opened once and shared across all ReadAt calls.
+	// os.File.ReadAt is documented as safe for concurrent use.
+	readFile *os.File
+
+	// Close/Read coordination
+	// closing is set to 1 when CloseWithContext starts, preventing new reads
+	closing atomic.Int32
+	// readers tracks active ReadAt calls in flight
+	readers sync.WaitGroup
 
 	// Reference counting and lifecycle
 	refCount atomic.Int32
 	closed   atomic.Bool
 	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	wg       sync.WaitGroup // Tracks downloader goroutine
 }
 
 // NewTempFileStore creates a new TempFileStore and starts downloading.
@@ -230,7 +237,10 @@ func (s *TempFileStore) Close() error {
 }
 
 // CloseWithContext releases resources and deletes the temp file with timeout support.
-// If the context times out, cleanup is attempted but the downloader may be left running.
+// CRITICAL: This method implements the readers gate pattern to prevent ReadAt/Close races.
+// 1. Flip the closing flag to prevent new reads from starting
+// 2. Wait for all in-flight ReadAt calls to complete
+// 3. Only then close the file handle and delete the temp file
 func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 	goid := goroutineid.Get()
 	log.Printf("[TempFileStore #%d] Close ENTER goid=%d", s.debugID, goid)
@@ -238,52 +248,99 @@ func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 		log.Printf("[TempFileStore #%d] Close EXIT goid=%d", s.debugID, goid)
 	}()
 	
-	if s.closed.Swap(true) {
-		return nil
+	// Check if already closed
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil // Already closed
 	}
 
-	// Cancel downloader
+	// Step 1: Flip closing flag to prevent new reads
+	if !s.closing.CompareAndSwap(0, 1) {
+		// Already closing (shouldn't happen due to closed check above, but be safe)
+		return nil
+	}
+	log.Printf("[TempFileStore #%d] Closing flag set, blocking new reads goid=%d", s.debugID, goid)
+
+	// Step 2: Cancel downloader
 	s.cancel()
 
-	// Wait for downloader to finish with context timeout
-	done := make(chan struct{})
+	// Step 3: Wait for downloader to finish
+	downloaderDone := make(chan struct{})
 	go func() {
 		s.wg.Wait()
-		close(done)
+		close(downloaderDone)
 	}()
 
 	select {
-	case <-done:
-		// Downloader finished cleanly
+	case <-downloaderDone:
 		log.Printf("[TempFileStore #%d] Downloader stopped cleanly goid=%d", s.debugID, goid)
 	case <-ctx.Done():
-		// Context timed out - log warning but continue cleanup
-		log.Printf("[TempFileStore #%d] Warning: Close timed out waiting for downloader, forcing cleanup goid=%d", s.debugID, goid)
+		log.Printf("[TempFileStore #%d] Warning: Close timed out waiting for downloader goid=%d", s.debugID, goid)
+		// Continue with cleanup even if downloader didn't finish
 	}
 
-	// Close cached read file handle
-	s.readFileMu.Lock()
+	// Step 4: Wait for all active ReadAt calls to drain
+	// This is the critical section - we must not close the file while reads are in flight
+	readersDone := make(chan struct{})
+	go func() {
+		s.readers.Wait()
+		close(readersDone)
+	}()
+
+	select {
+	case <-readersDone:
+		log.Printf("[TempFileStore #%d] All readers drained, safe to close file goid=%d", s.debugID, goid)
+	case <-ctx.Done():
+		// This is bad - we're being forced to close while readers are active
+		log.Printf("[TempFileStore #%d] ERROR: Close timed out waiting for readers to drain! goid=%d", s.debugID, goid)
+		return ctx.Err()
+	}
+
+	// Step 5: Now safe to close the file - no readers are using it
 	if s.readFile != nil {
-		s.readFile.Close()
+		if err := s.readFile.Close(); err != nil {
+			log.Printf("[TempFileStore #%d] Warning: error closing read file: %v goid=%d", s.debugID, err, goid)
+		}
 		s.readFile = nil
 	}
-	s.readFileMu.Unlock()
 
-	// Remove temp file (best effort)
-	return os.Remove(s.tempPath)
+	// Step 6: Remove temp file (best effort)
+	if err := os.Remove(s.tempPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("[TempFileStore #%d] Warning: error removing temp file: %v goid=%d", s.debugID, err, goid)
+		return err
+	}
+
+	return nil
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
-// CRITICAL: Uses dual-channel signaling to avoid missed-wakeup races.
-// - doneCh is closed when download completes (success or error)
-// - notifyCh receives periodic progress updates (buffered, non-blocking)
-// This ensures readers can't miss the completion signal even if they arrive late.
+// CRITICAL: Implements readers gate pattern to prevent races with Close.
+// 1. Check closing flag - bail out immediately if closing
+// 2. Register as active reader (increment WaitGroup)
+// 3. Wait for data to be downloaded
+// 4. Perform read from shared file handle (safe for concurrent use)
+// 5. Unregister as active reader (decrement WaitGroup)
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	goid := goroutineid.Get()
 	log.Printf("[TempFileStore #%d] ReadAt ENTER off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
 	defer func() {
 		log.Printf("[TempFileStore #%d] ReadAt EXIT off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
 	}()
+	
+	// Step 1: Check if store is closing - bail out immediately
+	if s.closing.Load() != 0 {
+		return 0, fmt.Errorf("temp file closed")
+	}
+
+	// Step 2: Register as active reader
+	// This MUST happen before we access the file handle
+	s.readers.Add(1)
+	defer s.readers.Done()
+
+	// Double-check closing flag after registering
+	// This prevents TOCTOU race where Close could start between our check and Add
+	if s.closing.Load() != 0 {
+		return 0, fmt.Errorf("temp file closed")
+	}
 	
 	if off >= s.size {
 		return 0, io.EOF
@@ -296,7 +353,7 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 		p = p[:s.size-off]
 	}
 
-	// Wait until desired region is downloaded or an error/ctx cancel occurs
+	// Step 3: Wait until desired region is downloaded or an error/ctx cancel occurs
 	// Use dual-channel signaling:
 	// 1. doneCh is closed when download finishes - guarantees wake-up
 	// 2. notifyCh receives periodic progress updates - reduces polling
@@ -331,12 +388,12 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 		}
 	}
 
-	// Read from cached temp file handle - NO LOCKS HELD during I/O
-	// Note: os.File.ReadAt is safe for concurrent use according to Go docs
-	s.readFileMu.RLock()
+	// Step 4: Read from shared temp file handle - NO LOCKS HELD during I/O
+	// Note: os.File.ReadAt is documented as safe for concurrent use
+	// The file won't be closed while we're here because:
+	// - We registered with readers.Add(1)
+	// - CloseWithContext waits for readers.Wait() before closing
 	f := s.readFile
-	s.readFileMu.RUnlock()
-
 	if f == nil {
 		return 0, fmt.Errorf("temp file closed")
 	}

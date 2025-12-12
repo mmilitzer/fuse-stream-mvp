@@ -220,10 +220,11 @@ func TestReadCloseConcurrent(t *testing.T) {
 		}(i)
 	}
 
-	// Let readers run for a bit
-	time.Sleep(200 * time.Millisecond)
+	// Let readers run for a bit to ensure they're actively reading when we close
+	time.Sleep(50 * time.Millisecond)
 
 	// Now close the store while readers are active
+	// This is the real race test - no artificial delays before close
 	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	closeErr := store.CloseWithContext(closeCtx)
 	cancel()
