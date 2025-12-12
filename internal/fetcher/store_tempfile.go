@@ -10,6 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mmilitzer/fuse-stream-mvp/internal/goroutineid"
+)
+
+var (
+	// Global debug ID counter for unique TempFileStore identification
+	storeDebugIDCounter atomic.Uint64
 )
 
 // TempFileStore implements BackingStore by downloading the entire file sequentially to disk.
@@ -18,14 +25,18 @@ type TempFileStore struct {
 	size     int64
 	tempPath string
 	client   *http.Client
+	debugID  uint64 // Unique ID for this store instance
 
 	// Download state
 	downloaded atomic.Int64
 	err        error
 	errMu      sync.RWMutex
 	
-	// Progress notification channel - closed when download finishes or errors
-	progressCh chan struct{}
+	// Progress notification - uses broadcast channel pattern
+	// doneCh is closed when download completes (success or error)
+	doneCh     chan struct{}
+	// notifyCh receives periodic progress updates
+	notifyCh   chan struct{}
 	
 	// Cached file handle for reads (reduces syscall overhead)
 	readFile   *os.File
@@ -63,17 +74,24 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		return nil, fmt.Errorf("open temp file for reading: %w", err)
 	}
 
+	// Assign unique debug ID
+	debugID := storeDebugIDCounter.Add(1)
+
 	// Create store
 	ctx, cancel := context.WithCancel(ctx)
 	store := &TempFileStore{
-		url:        url,
-		size:       size,
-		tempPath:   tempPath,
-		client:     &http.Client{Timeout: 5 * time.Minute},
-		cancel:     cancel,
-		progressCh: make(chan struct{}),
-		readFile:   readFile,
+		url:      url,
+		size:     size,
+		tempPath: tempPath,
+		client:   &http.Client{Timeout: 5 * time.Minute},
+		cancel:   cancel,
+		debugID:  debugID,
+		doneCh:   make(chan struct{}),
+		notifyCh: make(chan struct{}, 100), // Buffered to avoid blocking downloader
+		readFile: readFile,
 	}
+
+	log.Printf("[TempFileStore #%d] Created for %s (size=%d) goid=%d", debugID, url, size, goroutineid.Get())
 
 	// Start downloader goroutine
 	store.wg.Add(1)
@@ -86,8 +104,15 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 // CRITICAL: This method does file I/O and network I/O - it must NOT hold any locks
 // across these operations. Only lock briefly to update shared state.
 func (s *TempFileStore) downloader(ctx context.Context) {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] downloader ENTER goid=%d", s.debugID, goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] downloader EXIT goid=%d downloaded=%d/%d", s.debugID, goid, s.downloaded.Load(), s.size)
+	}()
+	
 	defer s.wg.Done()
-	defer close(s.progressCh) // Signal completion to all waiters
+	defer close(s.doneCh)    // Signal all waiters that download is done
+	defer close(s.notifyCh)  // Close notification channel
 
 	// Open temp file for writing - no locks needed, this is private to downloader
 	f, err := os.OpenFile(s.tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -143,12 +168,12 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 			// Update progress atomically (no lock needed for atomic operation)
 			s.downloaded.Store(totalWritten)
 			
-			// Signal progress on channel - non-blocking send
+			// Signal progress on buffered channel - non-blocking send
 			// Readers use this to wake up and recheck progress
 			select {
-			case s.progressCh <- struct{}{}:
+			case s.notifyCh <- struct{}{}:
 			default:
-				// Channel full or no readers, that's fine
+				// Channel full, that's fine - readers will check again on doneCh
 			}
 		}
 
@@ -156,6 +181,7 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 			if readErr == io.EOF {
 				// Success!
 				s.downloaded.Store(s.size)
+				log.Printf("[TempFileStore #%d] Download complete goid=%d", s.debugID, goid)
 				return
 			}
 			s.setError(fmt.Errorf("read from response: %w", readErr))
@@ -206,6 +232,12 @@ func (s *TempFileStore) Close() error {
 // CloseWithContext releases resources and deletes the temp file with timeout support.
 // If the context times out, cleanup is attempted but the downloader may be left running.
 func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] Close ENTER goid=%d", s.debugID, goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] Close EXIT goid=%d", s.debugID, goid)
+	}()
+	
 	if s.closed.Swap(true) {
 		return nil
 	}
@@ -223,9 +255,10 @@ func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 	select {
 	case <-done:
 		// Downloader finished cleanly
+		log.Printf("[TempFileStore #%d] Downloader stopped cleanly goid=%d", s.debugID, goid)
 	case <-ctx.Done():
 		// Context timed out - log warning but continue cleanup
-		log.Printf("[TempFileStore] Warning: Close timed out waiting for downloader, forcing cleanup")
+		log.Printf("[TempFileStore #%d] Warning: Close timed out waiting for downloader, forcing cleanup goid=%d", s.debugID, goid)
 	}
 
 	// Close cached read file handle
@@ -241,9 +274,17 @@ func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
-// CRITICAL: Uses channel-based signaling instead of sync.Cond to avoid missed-wakeup races.
-// The downloader closes progressCh when finished, ensuring no reader can miss the signal.
+// CRITICAL: Uses dual-channel signaling to avoid missed-wakeup races.
+// - doneCh is closed when download completes (success or error)
+// - notifyCh receives periodic progress updates (buffered, non-blocking)
+// This ensures readers can't miss the completion signal even if they arrive late.
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] ReadAt ENTER off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] ReadAt EXIT off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
+	}()
+	
 	if off >= s.size {
 		return 0, io.EOF
 	}
@@ -256,7 +297,9 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 
 	// Wait until desired region is downloaded or an error/ctx cancel occurs
-	// Use channel-based signaling to avoid missed-wakeup races with sync.Cond
+	// Use dual-channel signaling:
+	// 1. doneCh is closed when download finishes - guarantees wake-up
+	// 2. notifyCh receives periodic progress updates - reduces polling
 	for {
 		// Check if we have enough data
 		downloaded := s.downloaded.Load()
@@ -274,18 +317,22 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 			return 0, ctx.Err()
 		}
 
-		// Wait for progress signal or context cancellation
-		// The downloader sends on progressCh after each chunk write and closes it when done
-		// Closing the channel ensures all readers wake up (no missed signals)
+		// Wait for progress signal, completion, or context cancellation
+		// Using both doneCh and notifyCh ensures we wake up promptly
 		select {
-		case <-s.progressCh:
-			// Progress signal received (or channel closed), loop to recheck
+		case <-s.doneCh:
+			// Download finished - loop once more to check final state
+			continue
+		case <-s.notifyCh:
+			// Progress update received - loop to recheck
+			continue
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
 	}
 
 	// Read from cached temp file handle - NO LOCKS HELD during I/O
+	// Note: os.File.ReadAt is safe for concurrent use according to Go docs
 	s.readFileMu.RLock()
 	f := s.readFile
 	s.readFileMu.RUnlock()
