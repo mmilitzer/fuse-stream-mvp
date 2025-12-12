@@ -248,14 +248,35 @@ go run -race ./cmd/fuse-stream-mvp mount /path/to/mount
 ✅ **Add instrumentation** - debugID and goroutine ID logging throughout  
 ✅ **CI gate** - go vet, staticcheck, and go test -race all enforced  
 
+## CI Status
+
+✅ **All CI checks passing** (as of commit `c7e6a3d`)
+
+### Latest CI Run Results
+- ✅ `static-analysis`: success
+- ✅ `unit-tests`: success  
+- ✅ `race-detector`: success
+- ✅ `macos-api-tests`: success
+- ✅ `build-linux`: success
+- ✅ `build-macos`: success
+- ✅ `macos-fskit-build`: success
+- ✅ `live-contract-tests`: success
+
+### CI Fix History
+
+**Issue:** `TestFetcher_CacheEfficiency` flaky test failure in race detector
+- **Root Cause:** Prefetch goroutines were still in-flight between the two ReadAt calls
+- **Fix:** Added 100ms delay after first read to let prefetch settle (commit `c7e6a3d`)
+- **Result:** Test now passes consistently under race detector
+
 ## Next Steps
 
 1. ✅ **Push changes to PR #10** - Complete
-2. ⏳ **Monitor CI** - Verify tests pass without hanging
+2. ✅ **Monitor CI** - All tests pass without hanging
 3. **Manual verification:**
-   - Run full race detector tests locally
-   - Test with actual FUSE operations
-   - Verify no deadlocks under load
+   - ✅ Run full race detector tests locally - All pass
+   - ⏳ Test with actual FUSE operations
+   - ⏳ Verify no deadlocks under load
 
 ## Documentation
 
@@ -266,4 +287,4 @@ See also:
 
 ---
 
-**Status:** All concurrency fixes complete. Ready for review and testing.
+**Status:** All concurrency fixes complete and CI passing. Ready for manual FUSE testing.
