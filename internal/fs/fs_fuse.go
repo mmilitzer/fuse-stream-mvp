@@ -116,9 +116,17 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 
 	// Mount options (OS-specific)
 	// CRITICAL: Do NOT use -s (single-threaded) or -o singlethread - we need parallel FUSE
+	// UNLESS debugFSKitSingleThread is enabled for debugging
 	mountOpts := []string{
 		"-o", "ro",
 		"-o", "fsname=fusestream",
+	}
+
+	// Add single-threaded mode if debug flag is set
+	if fs.config.DebugFSKitSingleThread {
+		mountOpts = append(mountOpts, "-s")
+		log.Printf("[fs] WARNING: Single-threaded FUSE mode enabled (debugFSKitSingleThread=true)")
+		log.Printf("[fs] This is for debugging only and will severely limit performance")
 	}
 
 	switch runtime.GOOS {
@@ -136,9 +144,11 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 		// and can be gated by a config option in the future
 	}
 
-	// Log mount options to verify we're not in single-threaded mode
+	// Log mount options to verify we're not in single-threaded mode (unless debug mode)
 	log.Printf("[fs] Mount options: %v", mountOpts)
-	log.Printf("[fs] IMPORTANT: Verify NO -s or -o singlethread in mount options (parallel mode required)")
+	if !fs.config.DebugFSKitSingleThread {
+		log.Printf("[fs] IMPORTANT: Parallel FUSE mode is active (required for production)")
+	}
 
 	// Mount the filesystem
 	// Note: host.Mount() is a blocking call that runs the FUSE event loop.
@@ -516,6 +526,7 @@ func (fs *fuseFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *fuseFS) Access(path string, mask uint32) int {
+	defer fs.watchdog.enter("Access")()
 	defer logging.FUSETrace("Access", "path=%s mask=%d", path, mask)()
 	stat := &fuse.Stat_t{}
 	result := fs.Getattr(path, stat, 0)
@@ -594,20 +605,33 @@ func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 
 	// Root directory - show Staged/
 	if path == "" {
-		fill(".", nil, 0)
-		fill("..", nil, 0)
-		fill(stagedDirName, nil, 0)
+		if !fill(".", nil, 0) {
+			return 0
+		}
+		if !fill("..", nil, 0) {
+			return 0
+		}
+		if !fill(stagedDirName, nil, 0) {
+			return 0
+		}
 		return 0
 	}
 
 	// Staged directory - show all staged file subdirectories
 	if path == stagedDirName {
-		fill(".", nil, 0)
-		fill("..", nil, 0)
+		if !fill(".", nil, 0) {
+			return 0
+		}
+		if !fill("..", nil, 0) {
+			return 0
+		}
 
 		fs.mu.RLock()
 		for id := range fs.stagedFiles {
-			fill(id, nil, 0)
+			if !fill(id, nil, 0) {
+				fs.mu.RUnlock()
+				return 0
+			}
 		}
 		fs.mu.RUnlock()
 
@@ -624,9 +648,15 @@ func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 			fs.mu.RUnlock()
 
 			if exists {
-				fill(".", nil, 0)
-				fill("..", nil, 0)
-				fill(sf.FileName, nil, 0)
+				if !fill(".", nil, 0) {
+					return 0
+				}
+				if !fill("..", nil, 0) {
+					return 0
+				}
+				if !fill(sf.FileName, nil, 0) {
+					return 0
+				}
 				return 0
 			}
 		}
@@ -838,12 +868,43 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)",
 			fh, tileRef, newOpenRef, newStoreRefCount)
 
-		// If both refs are 0, try to evict
+		// If both refs are 0, try to evict (but skip if debug flag is set)
 		if tileRef == 0 && newOpenRef == 0 {
-			log.Printf("Release: Both refs are 0 for %s, attempting eviction", stagedID)
-			fs.mu.Lock()
-			fs.tryEvictLocked(stagedID)
-			fs.mu.Unlock()
+			if fs.config.DebugSkipEviction {
+				log.Printf("Release: Both refs are 0 for %s, but skipping eviction (debugSkipEviction=true)", stagedID)
+			} else {
+				log.Printf("Release: Both refs are 0 for %s, attempting non-blocking eviction", stagedID)
+				// CRITICAL: Make eviction non-blocking to prevent Release from blocking
+				// Detach the store from the registry without holding locks across Close()
+				fs.mu.Lock()
+				sff, ok := fs.stagedFiles[stagedID]
+				if ok {
+					// Grab the store and remove from map WITHOUT closing under the lock
+					sff.storeMu.Lock()
+					storeToClose := sff.store
+					sff.store = nil
+					delete(fs.stagedFiles, stagedID)
+					sff.storeMu.Unlock()
+					fs.mu.Unlock()
+
+					// Close in background with a timeout-aware context
+					// This ensures Close() can't block the FUSE worker thread
+					if storeToClose != nil {
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+							log.Printf("Release: Closing BackingStore for %s in background", stagedID)
+							if err := storeToClose.CloseWithContext(ctx); err != nil {
+								log.Printf("Release: Error closing store for %s: %v", stagedID, err)
+							} else {
+								log.Printf("Release: BackingStore closed successfully for %s", stagedID)
+							}
+						}()
+					}
+				} else {
+					fs.mu.Unlock()
+				}
+			}
 		}
 	} else {
 		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists",

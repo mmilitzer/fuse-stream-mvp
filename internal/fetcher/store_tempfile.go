@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -199,6 +200,12 @@ func (s *TempFileStore) RefCount() int32 {
 
 // Close releases resources and deletes the temp file.
 func (s *TempFileStore) Close() error {
+	return s.CloseWithContext(context.Background())
+}
+
+// CloseWithContext releases resources and deletes the temp file with timeout support.
+// If the context times out, cleanup is attempted but the downloader may be left running.
+func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 	if s.closed.Swap(true) {
 		return nil
 	}
@@ -206,8 +213,20 @@ func (s *TempFileStore) Close() error {
 	// Cancel downloader
 	s.cancel()
 
-	// Wait for downloader to finish
-	s.wg.Wait()
+	// Wait for downloader to finish with context timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Downloader finished cleanly
+	case <-ctx.Done():
+		// Context timed out - log warning but continue cleanup
+		log.Printf("[TempFileStore] Warning: Close timed out waiting for downloader, forcing cleanup")
+	}
 
 	// Close cached read file handle
 	s.readFileMu.Lock()
@@ -217,7 +236,7 @@ func (s *TempFileStore) Close() error {
 	}
 	s.readFileMu.Unlock()
 
-	// Remove temp file
+	// Remove temp file (best effort)
 	return os.Remove(s.tempPath)
 }
 

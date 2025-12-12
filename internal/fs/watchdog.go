@@ -23,6 +23,7 @@ type opKey struct {
 type watchdog struct {
 	mu       sync.Mutex
 	inflight map[opKey]time.Time
+	opCounts map[string]int // Count of in-flight operations per operation type
 	seq      atomic.Uint64
 	logDir   string
 	enabled  bool
@@ -49,6 +50,7 @@ func newWatchdog(logDir string) *watchdog {
 	
 	w := &watchdog{
 		inflight: make(map[opKey]time.Time),
+		opCounts: make(map[string]int),
 		logDir:   logDir,
 		stopCh:   make(chan struct{}),
 		stopped:  make(chan struct{}),
@@ -87,7 +89,7 @@ func (w *watchdog) stop() {
 }
 
 // enter marks the start of a FUSE operation and returns a cleanup function
-// Usage: defer w.enter("Read", fh)()
+// Usage: defer w.enter("Read")()
 func (w *watchdog) enter(kind string) func() {
 	if !w.enabled {
 		return func() {}
@@ -95,15 +97,25 @@ func (w *watchdog) enter(kind string) func() {
 	
 	id := w.seq.Add(1)
 	key := opKey{kind: kind, id: id}
+	startTime := time.Now()
 	
 	w.mu.Lock()
-	w.inflight[key] = time.Now()
+	w.inflight[key] = startTime
+	w.opCounts[kind]++
 	w.mu.Unlock()
 	
+	log.Printf("[FUSE] %s ENTER (id=%d)", kind, id)
+	
 	return func() {
+		elapsed := time.Since(startTime)
 		w.mu.Lock()
 		delete(w.inflight, key)
+		w.opCounts[kind]--
+		if w.opCounts[kind] <= 0 {
+			delete(w.opCounts, kind)
+		}
 		w.mu.Unlock()
+		log.Printf("[FUSE] %s EXIT (id=%d, elapsed=%v)", kind, id, elapsed)
 	}
 }
 
@@ -131,6 +143,7 @@ func (w *watchdog) checkForStalls(threshold time.Duration) {
 	w.mu.Lock()
 	now := time.Now()
 	stalled := make([]string, 0)
+	opCountsCopy := make(map[string]int)
 	
 	for key, startTime := range w.inflight {
 		duration := now.Sub(startTime)
@@ -138,12 +151,23 @@ func (w *watchdog) checkForStalls(threshold time.Duration) {
 			stalled = append(stalled, fmt.Sprintf("%s#%d (running for %v)", key.kind, key.id, duration))
 		}
 	}
+	
+	// Copy opCounts for logging (avoid holding lock during I/O)
+	for op, count := range w.opCounts {
+		opCountsCopy[op] = count
+	}
 	w.mu.Unlock()
 	
 	if len(stalled) > 0 {
 		log.Printf("[watchdog] WARNING: Detected %d stalled operations:", len(stalled))
 		for _, op := range stalled {
 			log.Printf("[watchdog]   - %s", op)
+		}
+		
+		// Log in-flight operation counts by type
+		log.Printf("[watchdog] In-flight operation counts by type:")
+		for op, count := range opCountsCopy {
+			log.Printf("[watchdog]   - %s: %d", op, count)
 		}
 		
 		// Write stack dump to file

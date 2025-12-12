@@ -128,6 +128,12 @@ func (s *RangeLRUStore) RefCount() int32 {
 
 // Close releases resources.
 func (s *RangeLRUStore) Close() error {
+	return s.CloseWithContext(context.Background())
+}
+
+// CloseWithContext releases resources with context timeout support.
+// For RangeLRUStore this is the same as Close since there are no blocking operations.
+func (s *RangeLRUStore) CloseWithContext(ctx context.Context) error {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	s.cache = nil
