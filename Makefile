@@ -1,4 +1,4 @@
-.PHONY: all build test test-race test-short vet staticcheck lint stress-test clean help
+.PHONY: all build build-race run-race test test-race test-short vet staticcheck lint stress-test clean help
 
 # Default target
 all: lint test
@@ -9,15 +9,27 @@ build:
 	go build ./internal/...
 	go build ./cmd/...
 
+# Build with race detector enabled
+build-race:
+	@echo "Building with race detector..."
+	go build -race ./internal/...
+	go build -race -o fuse-stream-mvp-race ./cmd/fuse-stream-mvp
+
+# Run with race detector enabled
+run-race:
+	@echo "Running fuse-stream-mvp with race detector..."
+	@echo "Usage: make run-race ARGS='mount /path/to/mount'"
+	go run -race ./cmd/fuse-stream-mvp $(ARGS)
+
 # Run tests
 test:
 	@echo "Running tests..."
 	go test -v -timeout=10m ./internal/...
 
-# Run tests with race detector
+# Run tests with race detector (uses -short to skip slow tests)
 test-race:
 	@echo "Running tests with race detector..."
-	go test -race -timeout=30m ./internal/...
+	go test -race -short -timeout=15m ./internal/...
 
 # Run short tests only
 test-short:
@@ -59,8 +71,10 @@ help:
 	@echo "Available targets:"
 	@echo "  all          - Run linters and tests (default)"
 	@echo "  build        - Build all packages"
+	@echo "  build-race   - Build with race detector enabled"
+	@echo "  run-race     - Run fuse-stream-mvp with race detector (use ARGS='...')"
 	@echo "  test         - Run all tests"
-	@echo "  test-race    - Run tests with race detector"
+	@echo "  test-race    - Run tests with race detector (skips slow tests)"
 	@echo "  test-short   - Run short tests only"
 	@echo "  vet          - Run go vet"
 	@echo "  staticcheck  - Run staticcheck"

@@ -30,6 +30,12 @@ Basic functionality tests without heavy concurrency:
 go test -short ./internal/fetcher/...
 ```
 
+**Note:** Tests marked as "slow" (using `testing.Short()`) are automatically skipped when using the `-short` flag. This includes:
+- `TestStressWithRandomGOMAXPROCS` - Stress test with multiple GOMAXPROCS variations
+- `TestNoDeadlockOnEarlyClose` - Slow server simulation test
+
+These slow tests are skipped in CI to prevent timeouts, but should be run manually during development.
+
 ### 2. Concurrency Tests
 Focused tests for multi-threaded safety:
 ```bash
@@ -45,7 +51,18 @@ Individual tests:
 ### 3. Race Detector Tests
 Detects data races at runtime (slower, ~10x):
 ```bash
-go test -race ./internal/fetcher/...
+# Quick race detection (skips slow tests)
+make test-race
+# or
+go test -race -short ./internal/...
+
+# Full race detection (includes slow tests, ~15-30 min)
+go test -race ./internal/...
+
+# Run the full application with race detector
+make run-race ARGS='mount /path/to/mount'
+# or
+go run -race ./cmd/fuse-stream-mvp mount /path/to/mount
 ```
 
 ### 4. Stress Tests

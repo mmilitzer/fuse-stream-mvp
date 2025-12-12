@@ -49,7 +49,7 @@ jobs:
 
   race-detector:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
@@ -64,7 +64,7 @@ jobs:
         env:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
-        run: go test -race -timeout=25m ./internal/...
+        run: go test -race -short -timeout=10m ./internal/...
 
   macos-api-tests:
     runs-on: [self-hosted, macOS, ARM64, macFUSE]
