@@ -30,6 +30,10 @@ type BackingStore interface {
 	// Close releases underlying resources.
 	// May delete temp files if refCount == 0.
 	Close() error
+
+	// CloseWithContext releases underlying resources with context timeout support.
+	// If the context is canceled or times out, cleanup is attempted but may be incomplete.
+	CloseWithContext(ctx context.Context) error
 }
 
 // FetchMode specifies the backing store implementation to use.

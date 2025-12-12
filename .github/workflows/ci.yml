@@ -4,6 +4,26 @@ on:
   pull_request:
 
 jobs:
+  static-analysis:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse-dev
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - name: Run go vet
+        run: go vet ./internal/...
+      - name: Run staticcheck
+        run: ~/go/bin/staticcheck ./internal/...
+
   unit-tests:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -26,6 +46,25 @@ jobs:
           MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
           MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
         run: go test ./... -run Test -v -tags fuse
+
+  race-detector:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse-dev
+      - name: Run tests with race detector
+        env:
+          MEDIAHUB_CLIENT_ID: ${{ secrets.MEDIAHUB_CLIENT_ID }}
+          MEDIAHUB_CLIENT_SECRET: ${{ secrets.MEDIAHUB_CLIENT_SECRET }}
+        run: go test -race -short -timeout=10m ./internal/...
 
   macos-api-tests:
     runs-on: [self-hosted, macOS, ARM64, macFUSE]

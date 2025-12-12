@@ -23,6 +23,10 @@ type Config struct {
 	
 	// System integration configuration
 	EnableAppNap bool `toml:"enable_app_nap"` // Prevent App Nap when filesystem is mounted (macOS only, default: false)
+	
+	// Debug configuration
+	DebugSkipEviction      bool `toml:"debug_skip_eviction"`       // Skip eviction in Release to isolate eviction bugs (default: false)
+	DebugFSKitSingleThread bool `toml:"debug_fskit_single_thread"` // Use single-threaded FUSE mode for debugging (default: false)
 }
 
 func Load() (*Config, error) {
