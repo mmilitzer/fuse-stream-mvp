@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"io/fs"
 	mrand "math/rand"
 	"net/http"
 	"net/http/httptest"
