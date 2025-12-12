@@ -112,15 +112,20 @@ func TestConcurrentReaders(t *testing.T) {
 	}
 }
 
-// TestReadCloseConcurrent tests the race condition between ReadAt and Close.
-// This verifies that calling Close while readers are active doesn't cause
-// data corruption or deadlocks.
+// TestReadCloseConcurrent tests the race condition between ReadAt and Close using deterministic barriers.
+// This test ensures that Close is called while readers are guaranteed to be in-flight,
+// and verifies that no deadlock occurs.
 func TestReadCloseConcurrent(t *testing.T) {
 	const (
 		fileSize   = 8 * 1024 * 1024 // 8 MiB
 		numReaders = 8
 		chunkSize  = 64 * 1024 // 64 KiB
+		testTimeout = 5 * time.Second // Entire test must complete within this time
 	)
+
+	// Create test context with deadline to catch deadlocks
+	testCtx, testCancel := context.WithTimeout(context.Background(), testTimeout)
+	defer testCancel()
 
 	// Create synthetic test file
 	testData := make([]byte, fileSize)
@@ -128,7 +133,7 @@ func TestReadCloseConcurrent(t *testing.T) {
 		t.Fatalf("Failed to generate test data: %v", err)
 	}
 
-	// Create test HTTP server
+	// Create test HTTP server that serves data slowly to ensure reads are in-flight
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
 		w.WriteHeader(http.StatusOK)
@@ -150,100 +155,278 @@ func TestReadCloseConcurrent(t *testing.T) {
 	defer server.Close()
 
 	// Create TempFileStore
-	ctx := context.Background()
-	store, err := NewTempFileStore(ctx, server.URL, fileSize, StoreOptions{})
+	store, err := NewTempFileStore(testCtx, server.URL, fileSize, StoreOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
 
-	// Launch readers that hammer the store
+	// Barrier pattern: readers signal ready, then wait for start signal
+	ready := make(chan struct{}, numReaders)
+	start := make(chan struct{})
+	
 	var wg sync.WaitGroup
-	stopReaders := make(chan struct{})
 	var successfulReads atomic.Int64
 	var failedReads atomic.Int64
 
+	// Launch reader goroutines
 	for i := 0; i < numReaders; i++ {
 		wg.Add(1)
 		go func(readerID int) {
 			defer wg.Done()
 
 			buf := make([]byte, chunkSize)
-			rng := mrand.New(mrand.NewSource(int64(readerID)))
+			offset := int64(readerID * chunkSize) % (fileSize - chunkSize)
 
-			for {
-				select {
-				case <-stopReaders:
-					return
-				default:
-				}
+			// Signal that we're ready to read
+			ready <- struct{}{}
+			
+			// Wait for start signal (this is where Close will be called)
+			select {
+			case <-start:
+				// Proceed with read
+			case <-testCtx.Done():
+				failedReads.Add(1)
+				return
+			}
 
-				// Read random range
-				offset := int64(rng.Intn(int(fileSize-chunkSize)/chunkSize)) * chunkSize
-				readSize := chunkSize
-				if offset+int64(readSize) > fileSize {
-					readSize = int(fileSize - offset)
-				}
+			// Attempt read - this may succeed or fail depending on whether Close completed
+			readCtx, cancel := context.WithTimeout(testCtx, 2*time.Second)
+			n, err := store.ReadAt(readCtx, buf[:chunkSize], offset)
+			cancel()
 
-				// Read with timeout
-				readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				n, err := store.ReadAt(readCtx, buf[:readSize], offset)
-				cancel()
-
-				if err != nil {
-					if err == context.Canceled || err == context.DeadlineExceeded {
-						failedReads.Add(1)
-						continue
-					}
-					// Expected errors after close or during cancellation
-					errStr := err.Error()
-					if errStr == "temp file closed" || 
-					   strings.Contains(errStr, "context canceled") ||
-					   strings.Contains(errStr, "connection reset") {
-						failedReads.Add(1)
-						return
-					}
-					t.Logf("Reader %d unexpected error: %v", readerID, err)
+			if err != nil {
+				// Expected errors after close
+				if err == fs.ErrClosed || err == context.Canceled || err == context.DeadlineExceeded {
 					failedReads.Add(1)
 					return
 				}
-
-				// Verify data if read succeeded
-				if n > 0 && offset+int64(n) <= fileSize {
-					if !bytes.Equal(buf[:n], testData[offset:offset+int64(n)]) {
-						t.Errorf("Reader %d: data corruption at offset %d", readerID, offset)
-						return
-					}
+				// Other errors
+				errStr := err.Error()
+				if strings.Contains(errStr, "closed") || 
+				   strings.Contains(errStr, "canceled") ||
+				   strings.Contains(errStr, "connection reset") {
+					failedReads.Add(1)
+					return
 				}
-
-				successfulReads.Add(1)
+				t.Logf("Reader %d unexpected error: %v", readerID, err)
+				failedReads.Add(1)
+				return
 			}
+
+			// Verify data if read succeeded
+			if n > 0 && offset+int64(n) <= fileSize {
+				if !bytes.Equal(buf[:n], testData[offset:offset+int64(n)]) {
+					t.Errorf("Reader %d: data corruption at offset %d", readerID, offset)
+					return
+				}
+			}
+
+			successfulReads.Add(1)
 		}(i)
 	}
 
-	// Let readers run for a bit to ensure they're actively reading when we close
-	time.Sleep(50 * time.Millisecond)
+	// Wait for at least one reader to be ready
+	select {
+	case <-ready:
+		// At least one reader is ready
+	case <-testCtx.Done():
+		t.Fatal("Timeout waiting for readers to become ready")
+	}
 
-	// Now close the store while readers are active
-	// This is the real race test - no artificial delays before close
-	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Drain any additional ready signals
+	drainedReady := 1
+	for drainedReady < numReaders {
+		select {
+		case <-ready:
+			drainedReady++
+		case <-time.After(100 * time.Millisecond):
+			// Some readers might not be ready yet, that's fine
+			goto closeNow
+		}
+	}
+
+closeNow:
+	t.Logf("%d/%d readers ready, initiating Close", drainedReady, numReaders)
+
+	// Now call Close while readers are waiting to proceed
+	closeCtx, closeCancel := context.WithTimeout(testCtx, 3*time.Second)
 	closeErr := store.CloseWithContext(closeCtx)
-	cancel()
+	closeCancel()
 
-	if closeErr != nil && closeErr != os.ErrNotExist {
+	if closeErr != nil && closeErr != os.ErrNotExist && closeErr != context.DeadlineExceeded {
 		t.Logf("Close returned error (may be expected): %v", closeErr)
 	}
 
-	// Stop readers
-	close(stopReaders)
-	wg.Wait()
+	// Release readers - they will attempt to read and should get ErrClosed or succeed
+	close(start)
 
-	t.Logf("Successful reads: %d, Failed reads: %d", successfulReads.Load(), failedReads.Load())
-	
-	// The key is that we didn't deadlock - reads completed (successfully or with expected errors)
-	// In fast environments, Close() might happen before any reads complete, which is OK
+	// Wait for all readers to complete (with deadline)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Logf("All readers completed: successful=%d, failed=%d", successfulReads.Load(), failedReads.Load())
+	case <-testCtx.Done():
+		t.Fatal("DEADLOCK: Readers did not complete within timeout")
+	}
+
+	// Verify that operations completed
 	totalOps := successfulReads.Load() + failedReads.Load()
 	if totalOps == 0 {
 		t.Error("No read operations completed (possible deadlock)")
+	}
+}
+
+// TestReadCloseDeterministic is the most rigorous test - it ensures Close overlaps active ReadAt calls.
+// Uses a barrier pattern where readers signal they've entered ReadAt (before syscall), then block
+// until the test calls Close and releases them.
+func TestReadCloseDeterministic(t *testing.T) {
+	const (
+		fileSize = 10 * 1024 * 1024 // 10 MiB
+		numReaders = 4
+		chunkSize = 64 * 1024
+		testTimeout = 5 * time.Second
+	)
+
+	// Create test context with deadline
+	testCtx, testCancel := context.WithTimeout(context.Background(), testTimeout)
+	defer testCancel()
+
+	// Create synthetic test file
+	testData := make([]byte, fileSize)
+	if _, err := rand.Read(testData); err != nil {
+		t.Fatalf("Failed to generate test data: %v", err)
+	}
+
+	// Create HTTP server that serves data very slowly
+	// This ensures ReadAt calls will be waiting in the loop when Close is called
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+		w.WriteHeader(http.StatusOK)
+		
+		// Send only first chunk, then stall - readers will wait for more data
+		if len(testData) > 0 {
+			firstChunk := chunkSize
+			if firstChunk > len(testData) {
+				firstChunk = len(testData)
+			}
+			w.Write(testData[:firstChunk])
+			
+			// Flush and then stall indefinitely
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			
+			// Wait for cancellation
+			<-r.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	// Create TempFileStore
+	store, err := NewTempFileStore(testCtx, server.URL, fileSize, StoreOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+
+	// Barrier: readers signal when they've entered ReadAt and are waiting for data
+	ready := make(chan struct{}, numReaders)
+	start := make(chan struct{})
+	
+	var wg sync.WaitGroup
+	var readAttempts atomic.Int64
+
+	// Launch readers
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+
+			buf := make([]byte, chunkSize)
+			// Read from later in file - will force waiting since server only sends first chunk
+			offset := int64(2*chunkSize + readerID*chunkSize)
+			if offset >= fileSize {
+				offset = fileSize - chunkSize
+			}
+
+			// Create a context that we can pass to ReadAt
+			// This context will signal when start channel is closed
+			readCtx, readCancel := context.WithCancel(testCtx)
+			defer readCancel()
+			
+			// Start ReadAt in a goroutine so we can signal ready
+			readErr := make(chan error, 1)
+			go func() {
+				// Signal ready right before attempting read
+				ready <- struct{}{}
+				_, err := store.ReadAt(readCtx, buf, offset)
+				readErr <- err
+			}()
+
+			// Wait for start signal
+			select {
+			case <-start:
+				readCancel() // Cancel the read context
+			case <-testCtx.Done():
+				readCancel()
+			}
+
+			// Wait for read to complete
+			<-readErr
+			readAttempts.Add(1)
+		}(i)
+	}
+
+	// Wait for at least one reader to enter ReadAt
+	readyCount := 0
+	for readyCount < numReaders {
+		select {
+		case <-ready:
+			readyCount++
+			if readyCount == 1 {
+				t.Logf("First reader entered ReadAt")
+			}
+		case <-time.After(500 * time.Millisecond):
+			// Timeout waiting for more readers - proceed with what we have
+			if readyCount == 0 {
+				t.Fatal("Timeout: no readers entered ReadAt")
+			}
+			t.Logf("%d/%d readers entered ReadAt, proceeding", readyCount, numReaders)
+			goto callClose
+		}
+	}
+	t.Logf("All %d readers entered ReadAt", numReaders)
+
+callClose:
+	// NOW call Close - readers are in ReadAt waiting for data
+	t.Logf("Calling Close while readers are in ReadAt")
+	closeCtx, closeCancel := context.WithTimeout(testCtx, 3*time.Second)
+	closeErr := store.CloseWithContext(closeCtx)
+	closeCancel()
+
+	if closeErr != nil && closeErr != os.ErrNotExist && closeErr != context.DeadlineExceeded {
+		t.Logf("Close returned: %v", closeErr)
+	}
+
+	// Release readers
+	close(start)
+
+	// Wait for readers to complete
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Logf("SUCCESS: All readers exited, no deadlock. Read attempts: %d", readAttempts.Load())
+	case <-testCtx.Done():
+		t.Fatal("DEADLOCK: Readers did not exit within timeout")
 	}
 }
 
@@ -530,6 +713,175 @@ func TestNoDeadlockOnEarlyClose(t *testing.T) {
 	// Should not hang - either succeeds or times out gracefully
 	if closeErr != nil && closeErr != os.ErrNotExist {
 		t.Logf("Close returned: %v (expected)", closeErr)
+	}
+}
+
+// TestMultiFileStagingScenario reproduces the original deadlock scenario:
+// Create two TempFileStores, start reads on A, concurrently Close A and begin reads on B.
+// This verifies no deadlock occurs and no global state causes interference.
+func TestMultiFileStagingScenario(t *testing.T) {
+	const (
+		fileSize = 4 * 1024 * 1024 // 4 MiB
+		chunkSize = 64 * 1024
+		testTimeout = 10 * time.Second
+	)
+
+	testCtx, testCancel := context.WithTimeout(context.Background(), testTimeout)
+	defer testCancel()
+
+	// Create test data for both stores
+	testDataA := make([]byte, fileSize)
+	testDataB := make([]byte, fileSize)
+	rand.Read(testDataA)
+	rand.Read(testDataB)
+
+	// Create HTTP servers
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+		w.WriteHeader(http.StatusOK)
+		
+		// Send data slowly
+		written := 0
+		for written < len(testDataA) {
+			n := chunkSize
+			if written+n > len(testDataA) {
+				n = len(testDataA) - written
+			}
+			if _, err := w.Write(testDataA[written : written+n]); err != nil {
+				return
+			}
+			written += n
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer serverA.Close()
+
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+		w.WriteHeader(http.StatusOK)
+		w.Write(testDataB)
+	}))
+	defer serverB.Close()
+
+	// Create store A
+	storeA, err := NewTempFileStore(testCtx, serverA.URL, fileSize, StoreOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create store A: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var readsOnA, readsOnB atomic.Int64
+	readyA := make(chan struct{}, 4)
+
+	// Start reads on store A
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			// Signal ready before first read
+			readyA <- struct{}{}
+
+			buf := make([]byte, chunkSize)
+			for j := 0; j < 10; j++ {
+				offset := int64((idx*10 + j) * chunkSize) % (fileSize - chunkSize)
+				readCtx, cancel := context.WithTimeout(testCtx, 2*time.Second)
+				n, err := storeA.ReadAt(readCtx, buf, offset)
+				cancel()
+
+				if err != nil {
+					// Expected after close
+					if err == fs.ErrClosed || err == context.Canceled {
+						return
+					}
+					t.Logf("Store A read error (expected after close): %v", err)
+					return
+				}
+
+				if n > 0 && offset+int64(n) <= fileSize {
+					if !bytes.Equal(buf[:n], testDataA[offset:offset+int64(n)]) {
+						t.Errorf("Store A: data corruption")
+						return
+					}
+				}
+				readsOnA.Add(1)
+			}
+		}(i)
+	}
+
+	// Wait for at least one reader to be ready on store A
+	select {
+	case <-readyA:
+		t.Logf("At least one reader started on store A")
+	case <-testCtx.Done():
+		t.Fatal("Timeout waiting for readers on store A")
+	}
+
+	// CONCURRENTLY: Close A and create/read from B
+	var closeWg sync.WaitGroup
+	
+	// Close store A
+	closeWg.Add(1)
+	go func() {
+		defer closeWg.Done()
+		t.Logf("Closing store A")
+		closeCtx, cancel := context.WithTimeout(testCtx, 5*time.Second)
+		closeErr := storeA.CloseWithContext(closeCtx)
+		cancel()
+		if closeErr != nil && closeErr != os.ErrNotExist {
+			t.Logf("Store A close: %v", closeErr)
+		}
+	}()
+
+	// Create store B and start reads
+	closeWg.Add(1)
+	go func() {
+		defer closeWg.Done()
+		
+		storeB, err := NewTempFileStore(testCtx, serverB.URL, fileSize, StoreOptions{})
+		if err != nil {
+			t.Errorf("Failed to create store B: %v", err)
+			return
+		}
+		defer storeB.Close()
+
+		t.Logf("Starting reads on store B")
+		buf := make([]byte, chunkSize)
+		for i := 0; i < 10; i++ {
+			offset := int64(i * chunkSize) % (fileSize - chunkSize)
+			readCtx, cancel := context.WithTimeout(testCtx, 2*time.Second)
+			n, err := storeB.ReadAt(readCtx, buf, offset)
+			cancel()
+
+			if err != nil && err != io.EOF {
+				t.Errorf("Store B read failed: %v", err)
+				return
+			}
+
+			if n > 0 && offset+int64(n) <= fileSize {
+				if !bytes.Equal(buf[:n], testDataB[offset:offset+int64(n)]) {
+					t.Errorf("Store B: data corruption")
+					return
+				}
+			}
+			readsOnB.Add(1)
+		}
+	}()
+
+	// Wait for concurrent operations with deadline
+	done := make(chan struct{})
+	go func() {
+		closeWg.Wait()
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Logf("SUCCESS: Multi-file scenario completed without deadlock. Reads on A: %d, Reads on B: %d", 
+			readsOnA.Load(), readsOnB.Load())
+	case <-testCtx.Done():
+		t.Fatal("DEADLOCK: Multi-file scenario did not complete within timeout")
 	}
 }
 

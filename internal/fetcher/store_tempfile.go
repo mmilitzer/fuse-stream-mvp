@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -328,7 +329,7 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	
 	// Step 1: Check if store is closing - bail out immediately
 	if s.closing.Load() != 0 {
-		return 0, fmt.Errorf("temp file closed")
+		return 0, fs.ErrClosed
 	}
 
 	// Step 2: Register as active reader
@@ -339,7 +340,7 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	// Double-check closing flag after registering
 	// This prevents TOCTOU race where Close could start between our check and Add
 	if s.closing.Load() != 0 {
-		return 0, fmt.Errorf("temp file closed")
+		return 0, fs.ErrClosed
 	}
 	
 	if off >= s.size {
@@ -358,6 +359,11 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	// 1. doneCh is closed when download finishes - guarantees wake-up
 	// 2. notifyCh receives periodic progress updates - reduces polling
 	for {
+		// Check if store is closing - exit promptly
+		if s.closing.Load() != 0 {
+			return 0, fs.ErrClosed
+		}
+
 		// Check if we have enough data
 		downloaded := s.downloaded.Load()
 		if downloaded >= wantEnd {
@@ -395,7 +401,7 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	// - CloseWithContext waits for readers.Wait() before closing
 	f := s.readFile
 	if f == nil {
-		return 0, fmt.Errorf("temp file closed")
+		return 0, fs.ErrClosed
 	}
 
 	n, err := f.ReadAt(p, off)
