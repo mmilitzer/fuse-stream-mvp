@@ -943,10 +943,14 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 
 		// If both refs are 0, try to evict (but skip if debug flag is set)
 		if tileRef == 0 && newOpenRef == 0 {
-			logging.FUSELog("[Release] Both refs are 0 for %s, attempting eviction", stagedID)
-			fs.mu.Lock()
-			fs.tryEvictLocked(stagedID)
-			fs.mu.Unlock()
+			if fs.config.DebugSkipEviction {
+				logging.FUSELog("[Release] Both refs are 0 for %s, but skipping eviction (debugSkipEviction=true)", stagedID)
+			} else {
+				logging.FUSELog("[Release] Both refs are 0 for %s, attempting eviction", stagedID)
+				fs.mu.Lock()
+				fs.tryEvictLocked(stagedID)
+				fs.mu.Unlock()
+			}
 		}
 	} else {
 		logging.FUSELog("[Release] fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
