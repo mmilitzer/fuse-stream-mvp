@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mmilitzer/fuse-stream-mvp/internal/goroutineid"
+)
+
+var (
+	// Global debug ID counter for unique TempFileStore identification
+	storeDebugIDCounter atomic.Uint64
 )
 
 // TempFileStore implements BackingStore by downloading the entire file sequentially to disk.
@@ -17,18 +26,35 @@ type TempFileStore struct {
 	size     int64
 	tempPath string
 	client   *http.Client
+	debugID  uint64 // Unique ID for this store instance
 
 	// Download state
 	downloaded atomic.Int64
 	err        error
 	errMu      sync.RWMutex
-	cond       *sync.Cond
+	
+	// Progress notification - uses broadcast channel pattern
+	// doneCh is closed when download completes (success or error)
+	doneCh     chan struct{}
+	// notifyCh receives periodic progress updates
+	notifyCh   chan struct{}
+	
+	// Shared file handle for concurrent reads
+	// The file is opened once and shared across all ReadAt calls.
+	// os.File.ReadAt is documented as safe for concurrent use.
+	readFile *os.File
+
+	// Close/Read coordination
+	// closing is set to 1 when CloseWithContext starts, preventing new reads
+	closing atomic.Int32
+	// readers tracks active ReadAt calls in flight
+	readers sync.WaitGroup
 
 	// Reference counting and lifecycle
 	refCount atomic.Int32
 	closed   atomic.Bool
 	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	wg       sync.WaitGroup // Tracks downloader goroutine
 }
 
 // NewTempFileStore creates a new TempFileStore and starts downloading.
@@ -49,6 +75,16 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 	tempPath := tempFile.Name()
 	tempFile.Close() // We'll reopen for writing in the downloader
 
+	// Open file for reading and cache the handle
+	readFile, err := os.Open(tempPath)
+	if err != nil {
+		os.Remove(tempPath)
+		return nil, fmt.Errorf("open temp file for reading: %w", err)
+	}
+
+	// Assign unique debug ID
+	debugID := storeDebugIDCounter.Add(1)
+
 	// Create store
 	ctx, cancel := context.WithCancel(ctx)
 	store := &TempFileStore{
@@ -57,8 +93,13 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		tempPath: tempPath,
 		client:   &http.Client{Timeout: 5 * time.Minute},
 		cancel:   cancel,
+		debugID:  debugID,
+		doneCh:   make(chan struct{}),
+		notifyCh: make(chan struct{}, 100), // Buffered to avoid blocking downloader
+		readFile: readFile,
 	}
-	store.cond = sync.NewCond(&sync.Mutex{})
+
+	log.Printf("[TempFileStore #%d] Created for %s (size=%d) goid=%d", debugID, url, size, goroutineid.Get())
 
 	// Start downloader goroutine
 	store.wg.Add(1)
@@ -68,10 +109,20 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 }
 
 // downloader runs in a goroutine and downloads the file sequentially.
+// CRITICAL: This method does file I/O and network I/O - it must NOT hold any locks
+// across these operations. Only lock briefly to update shared state.
 func (s *TempFileStore) downloader(ctx context.Context) {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] downloader ENTER goid=%d", s.debugID, goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] downloader EXIT goid=%d downloaded=%d/%d", s.debugID, goid, s.downloaded.Load(), s.size)
+	}()
+	
 	defer s.wg.Done()
+	defer close(s.doneCh)    // Signal all waiters that download is done
+	defer close(s.notifyCh)  // Close notification channel
 
-	// Open temp file for writing
+	// Open temp file for writing - no locks needed, this is private to downloader
 	f, err := os.OpenFile(s.tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		s.setError(fmt.Errorf("open temp file: %w", err))
@@ -79,14 +130,14 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 	}
 	defer f.Close()
 
-	// Create HTTP request
+	// Create HTTP request - no locks needed
 	req, err := http.NewRequestWithContext(ctx, "GET", s.url, nil)
 	if err != nil {
 		s.setError(fmt.Errorf("create request: %w", err))
 		return
 	}
 
-	// Execute request
+	// Execute request - no locks needed
 	resp, err := s.client.Do(req)
 	if err != nil {
 		s.setError(fmt.Errorf("http request: %w", err))
@@ -111,8 +162,10 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 		default:
 		}
 
+		// Read from network - no locks held
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			// Write to file - no locks held during I/O
 			written, writeErr := f.Write(buf[:n])
 			if writeErr != nil {
 				s.setError(fmt.Errorf("write to temp file: %w", writeErr))
@@ -120,16 +173,23 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 			}
 			totalWritten += int64(written)
 
-			// Update progress and notify waiters
+			// Update progress atomically (no lock needed for atomic operation)
 			s.downloaded.Store(totalWritten)
-			s.cond.Broadcast()
+			
+			// Signal progress on buffered channel - non-blocking send
+			// Readers use this to wake up and recheck progress
+			select {
+			case s.notifyCh <- struct{}{}:
+			default:
+				// Channel full, that's fine - readers will check again on doneCh
+			}
 		}
 
 		if readErr != nil {
 			if readErr == io.EOF {
 				// Success!
 				s.downloaded.Store(s.size)
-				s.cond.Broadcast()
+				log.Printf("[TempFileStore #%d] Download complete goid=%d", s.debugID, goid)
 				return
 			}
 			s.setError(fmt.Errorf("read from response: %w", readErr))
@@ -138,12 +198,11 @@ func (s *TempFileStore) downloader(ctx context.Context) {
 	}
 }
 
-// setError sets the error state and notifies waiters.
+// setError sets the error state.
 func (s *TempFileStore) setError(err error) {
 	s.errMu.Lock()
 	s.err = err
 	s.errMu.Unlock()
-	s.cond.Broadcast()
 }
 
 // getError returns the current error state.
@@ -175,23 +234,115 @@ func (s *TempFileStore) RefCount() int32 {
 
 // Close releases resources and deletes the temp file.
 func (s *TempFileStore) Close() error {
-	if s.closed.Swap(true) {
-		return nil
+	return s.CloseWithContext(context.Background())
+}
+
+// CloseWithContext releases resources and deletes the temp file with timeout support.
+// CRITICAL: This method implements the readers gate pattern to prevent ReadAt/Close races.
+// 1. Flip the closing flag to prevent new reads from starting
+// 2. Wait for all in-flight ReadAt calls to complete
+// 3. Only then close the file handle and delete the temp file
+func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] Close ENTER goid=%d", s.debugID, goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] Close EXIT goid=%d", s.debugID, goid)
+	}()
+	
+	// Check if already closed
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil // Already closed
 	}
 
-	// Cancel downloader
+	// Step 1: Flip closing flag to prevent new reads
+	if !s.closing.CompareAndSwap(0, 1) {
+		// Already closing (shouldn't happen due to closed check above, but be safe)
+		return nil
+	}
+	log.Printf("[TempFileStore #%d] Closing flag set, blocking new reads goid=%d", s.debugID, goid)
+
+	// Step 2: Cancel downloader
 	s.cancel()
-	s.cond.Broadcast()
 
-	// Wait for downloader to finish
-	s.wg.Wait()
+	// Step 3: Wait for downloader to finish
+	downloaderDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(downloaderDone)
+	}()
 
-	// Remove temp file
-	return os.Remove(s.tempPath)
+	select {
+	case <-downloaderDone:
+		log.Printf("[TempFileStore #%d] Downloader stopped cleanly goid=%d", s.debugID, goid)
+	case <-ctx.Done():
+		log.Printf("[TempFileStore #%d] Warning: Close timed out waiting for downloader goid=%d", s.debugID, goid)
+		// Continue with cleanup even if downloader didn't finish
+	}
+
+	// Step 4: Wait for all active ReadAt calls to drain
+	// This is the critical section - we must not close the file while reads are in flight
+	readersDone := make(chan struct{})
+	go func() {
+		s.readers.Wait()
+		close(readersDone)
+	}()
+
+	select {
+	case <-readersDone:
+		log.Printf("[TempFileStore #%d] All readers drained, safe to close file goid=%d", s.debugID, goid)
+	case <-ctx.Done():
+		// This is bad - we're being forced to close while readers are active
+		log.Printf("[TempFileStore #%d] ERROR: Close timed out waiting for readers to drain! goid=%d", s.debugID, goid)
+		return ctx.Err()
+	}
+
+	// Step 5: Now safe to close the file - no readers are using it
+	if s.readFile != nil {
+		if err := s.readFile.Close(); err != nil {
+			log.Printf("[TempFileStore #%d] Warning: error closing read file: %v goid=%d", s.debugID, err, goid)
+		}
+		s.readFile = nil
+	}
+
+	// Step 6: Remove temp file (best effort)
+	if err := os.Remove(s.tempPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("[TempFileStore #%d] Warning: error removing temp file: %v goid=%d", s.debugID, err, goid)
+		return err
+	}
+
+	return nil
 }
 
 // ReadAt reads data at the specified offset (implements BackingStore interface).
+// CRITICAL: Implements readers gate pattern to prevent races with Close.
+// 1. Check closing flag - bail out immediately if closing
+// 2. Register as active reader (increment WaitGroup)
+// 3. Wait for data to be downloaded
+// 4. Perform read from shared file handle (safe for concurrent use)
+// 5. Unregister as active reader (decrement WaitGroup)
 func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	goid := goroutineid.Get()
+	log.Printf("[TempFileStore #%d] ReadAt ENTER off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
+	defer func() {
+		log.Printf("[TempFileStore #%d] ReadAt EXIT off=%d len=%d goid=%d", s.debugID, off, len(p), goid)
+	}()
+	
+	// Step 1: Check if store is closing - bail out immediately
+	if s.closing.Load() != 0 {
+		return 0, fs.ErrClosed
+	}
+
+	// Step 2: Register as active reader
+	// This MUST happen before we access the file handle
+	s.readers.Add(1)
+	defer s.readers.Done()
+
+	// Double-check closing flag after registering
+	// This prevents TOCTOU race where Close could start between our check and Add
+	if s.closing.Load() != 0 {
+		return 0, fs.ErrClosed
+	}
+	
 	if off >= s.size {
 		return 0, io.EOF
 	}
@@ -203,40 +354,55 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 		p = p[:s.size-off]
 	}
 
-	// Wait until desired region is downloaded or an error/ctx cancel
-	s.cond.L.Lock()
+	// Step 3: Wait until desired region is downloaded or an error/ctx cancel occurs
+	// Use dual-channel signaling:
+	// 1. doneCh is closed when download finishes - guarantees wake-up
+	// 2. notifyCh receives periodic progress updates - reduces polling
 	for {
-		downloaded := s.downloaded.Load()
-		err := s.getError()
+		// Check if store is closing - exit promptly
+		if s.closing.Load() != 0 {
+			return 0, fs.ErrClosed
+		}
 
-		// If we have enough data, proceed
+		// Check if we have enough data
+		downloaded := s.downloaded.Load()
 		if downloaded >= wantEnd {
-			s.cond.L.Unlock()
 			break
 		}
 
-		// If there's an error and we don't have enough data, fail
-		if err != nil {
-			s.cond.L.Unlock()
+		// Check for errors
+		if err := s.getError(); err != nil {
 			return 0, err
 		}
 
-		// Check context
+		// Check context cancellation
 		if ctx.Err() != nil {
-			s.cond.L.Unlock()
 			return 0, ctx.Err()
 		}
 
-		// Wait for more data
-		s.cond.Wait()
+		// Wait for progress signal, completion, or context cancellation
+		// Using both doneCh and notifyCh ensures we wake up promptly
+		select {
+		case <-s.doneCh:
+			// Download finished - loop once more to check final state
+			continue
+		case <-s.notifyCh:
+			// Progress update received - loop to recheck
+			continue
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 
-	// Read from temp file
-	f, err := os.Open(s.tempPath)
-	if err != nil {
-		return 0, fmt.Errorf("open temp file: %w", err)
+	// Step 4: Read from shared temp file handle - NO LOCKS HELD during I/O
+	// Note: os.File.ReadAt is documented as safe for concurrent use
+	// The file won't be closed while we're here because:
+	// - We registered with readers.Add(1)
+	// - CloseWithContext waits for readers.Wait() before closing
+	f := s.readFile
+	if f == nil {
+		return 0, fs.ErrClosed
 	}
-	defer f.Close()
 
 	n, err := f.ReadAt(p, off)
 	if err != nil {

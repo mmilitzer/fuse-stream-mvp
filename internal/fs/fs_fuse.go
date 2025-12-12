@@ -21,6 +21,7 @@ import (
 	"github.com/mmilitzer/fuse-stream-mvp/internal/appnap"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/fetcher"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/logging"
+	"github.com/mmilitzer/fuse-stream-mvp/internal/signals"
 	"github.com/mmilitzer/fuse-stream-mvp/internal/sleep"
 	"github.com/mmilitzer/fuse-stream-mvp/pkg/config"
 	"github.com/winfsp/cgofuse/fuse"
@@ -32,7 +33,7 @@ type stagedFileFuse struct {
 	*StagedFile
 	store   fetcher.BackingStore
 	storeMu sync.Mutex
-	
+
 	// Two-ref tracking for lifecycle:
 	// - tileRef: 1 when tile is visible/staged, 0 when replaced or hidden
 	// - openRef: count of active FUSE handles (Open/Release)
@@ -51,25 +52,33 @@ type fuseFS struct {
 	host        *fuse.FileSystemHost
 	ctx         context.Context
 	cancel      context.CancelFunc
-	
+
 	// File handle management
-	nextFH        uint64
-	fhToStore     map[uint64]fetcher.BackingStore
-	fhToPath      map[uint64]string
-	fhToStagedID  map[uint64]string  // Maps file handle to staged file ID
-	fhMu          sync.RWMutex
-	
+	nextFH       uint64
+	fhToStore    map[uint64]fetcher.BackingStore
+	fhToPath     map[uint64]string
+	fhToStagedID map[uint64]string // Maps file handle to staged file ID
+	fhMu         sync.RWMutex
+
 	// Sleep prevention (IOPM assertion - prevents system sleep)
-	sleepRelease  func()
-	sleepMu       sync.Mutex
-	
+	sleepRelease func()
+	sleepMu      sync.Mutex
+
 	// App Nap prevention (NSProcessInfo activity - prevents process throttling)
 	appNapRelease func()
 	appNapMu      sync.Mutex
+
+	// Watchdog for detecting stalled FUSE operations
+	watchdog *watchdog
 }
 
 func newFS(client *api.Client, cfg *config.Config) FS {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Initialize watchdog for FUSE operation monitoring
+	// Log directory will be created in ~/Library/Logs/FuseStream (macOS) or ~/.local/share/FuseStream (Linux)
+	wd := newWatchdog("")
+
 	return &fuseFS{
 		client:       client,
 		config:       cfg,
@@ -80,12 +89,21 @@ func newFS(client *api.Client, cfg *config.Config) FS {
 		nextFH:       1,
 		ctx:          ctx,
 		cancel:       cancel,
+		watchdog:     wd,
 	}
 }
 
 func (fs *fuseFS) Start(opts MountOptions) error {
 	fs.mountpoint = opts.Mountpoint
-	
+
+	// Start watchdog for FUSE operation monitoring
+	fs.watchdog.start()
+
+	// Setup SIGQUIT handler for on-demand stack dumps
+	signals.SetupDebugSignalHandler(func() {
+		fs.watchdog.dumpStacks()
+	})
+
 	// Attempt mount recovery on macOS
 	if runtime.GOOS == "darwin" {
 		if err := fs.recoverStaleMountMacOS(); err != nil {
@@ -93,13 +111,22 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 			// Continue anyway - the mount attempt below will fail if there's still an issue
 		}
 	}
-	
+
 	fs.host = fuse.NewFileSystemHost(fs)
-	
+
 	// Mount options (OS-specific)
+	// CRITICAL: Do NOT use -s (single-threaded) or -o singlethread - we need parallel FUSE
+	// UNLESS debugFSKitSingleThread is enabled for debugging
 	mountOpts := []string{
 		"-o", "ro",
 		"-o", "fsname=fusestream",
+	}
+
+	// Add single-threaded mode if debug flag is set
+	if fs.config.DebugFSKitSingleThread {
+		mountOpts = append(mountOpts, "-s")
+		log.Printf("[fs] WARNING: Single-threaded FUSE mode enabled (debugFSKitSingleThread=true)")
+		log.Printf("[fs] This is for debugging only and will severely limit performance")
 	}
 
 	switch runtime.GOOS {
@@ -109,12 +136,18 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 		mountOpts = append(mountOpts,
 			"-o", "local",
 			"-o", "volname=FuseStream",
-			"-o", "backend=fskit",  // Required for FSKit backend
+			"-o", "backend=fskit", // Required for FSKit backend
 		)
 	case "linux":
 		// Linux: NO volname (not supported), and NO allow_other by default
 		// If you need allow_other, it requires user_allow_other in /etc/fuse.conf
 		// and can be gated by a config option in the future
+	}
+
+	// Log mount options to verify we're not in single-threaded mode (unless debug mode)
+	log.Printf("[fs] Mount options: %v", mountOpts)
+	if !fs.config.DebugFSKitSingleThread {
+		log.Printf("[fs] IMPORTANT: Parallel FUSE mode is active (required for production)")
 	}
 
 	// Mount the filesystem
@@ -159,7 +192,7 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 			if _, err := os.ReadDir(fs.mountpoint); err == nil {
 				log.Printf("[fs] Filesystem is ready and responding to operations")
 				fs.mounted = true
-				
+
 				// Enable App Nap prevention if configured
 				if fs.config.EnableAppNap {
 					fs.enableAppNapPrevention()
@@ -167,12 +200,12 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 				} else {
 					log.Printf("[fs] App Nap prevention is DISABLED (config: enable_app_nap=false)")
 				}
-				
+
 				return nil
 			}
 		}
 	}
-	
+
 	// Timeout - mount didn't become ready in time
 	return fmt.Errorf("mount timed out at %s - filesystem not responding", fs.mountpoint)
 }
@@ -198,14 +231,14 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 				log.Printf("[fs] Mount recovery: mountpoint %s doesn't exist (expected for /Volumes paths - mount helper will create it)", fs.mountpoint)
 				return nil
 			}
-			
+
 			// For non-/Volumes paths (e.g., testing), create the directory
 			log.Printf("[fs] Mount recovery: creating non-/Volumes mountpoint %s", fs.mountpoint)
 			return os.MkdirAll(fs.mountpoint, 0755)
 		}
 		return nil
 	}
-	
+
 	// Try to detect if it's a stale mount by attempting to list directory
 	// A stale FUSE mount will typically hang or error
 	doneCh := make(chan error, 1)
@@ -213,7 +246,7 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 		_, err := os.ReadDir(fs.mountpoint)
 		doneCh <- err
 	}()
-	
+
 	select {
 	case err := <-doneCh:
 		// If we can read the directory, it might be a valid mount or just a regular directory
@@ -227,7 +260,7 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 		// Timeout - likely a stale mount that's hanging
 		log.Printf("[fs] Mount recovery: timeout accessing mountpoint %s, attempting force unmount", fs.mountpoint)
 	}
-	
+
 	// Try diskutil unmount force (preferred on macOS)
 	log.Printf("[fs] Attempting: diskutil unmount force %s", fs.mountpoint)
 	cmd := fmt.Sprintf("diskutil unmount force '%s' 2>&1 || umount -f '%s' 2>&1 || true", fs.mountpoint, fs.mountpoint)
@@ -237,19 +270,24 @@ func (fs *fuseFS) recoverStaleMountMacOS() error {
 	} else {
 		log.Printf("[fs] Mount recovery successful or no mount present: %s", string(output))
 	}
-	
+
 	// Give the system a moment to finish unmounting
 	time.Sleep(200 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (fs *fuseFS) Stop() error {
+	// Stop watchdog
+	if fs.watchdog != nil {
+		fs.watchdog.stop()
+	}
+
 	// Evict all staged files to clean up BackingStores
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("[fs] Error evicting staged files: %v", err)
 	}
-	
+
 	// Release App Nap prevention if active
 	fs.appNapMu.Lock()
 	if fs.appNapRelease != nil {
@@ -258,7 +296,7 @@ func (fs *fuseFS) Stop() error {
 		log.Println("[fs] App Nap prevention released")
 	}
 	fs.appNapMu.Unlock()
-	
+
 	// Release sleep prevention if active
 	fs.sleepMu.Lock()
 	if fs.sleepRelease != nil {
@@ -267,10 +305,10 @@ func (fs *fuseFS) Stop() error {
 		log.Println("[fs] Sleep prevention released")
 	}
 	fs.sleepMu.Unlock()
-	
+
 	// Cancel context to signal any ongoing operations to stop
 	fs.cancel()
-	
+
 	// Unmount the filesystem
 	if fs.host != nil {
 		log.Println("[fs] Unmounting filesystem...")
@@ -288,11 +326,11 @@ func (fs *fuseFS) Stop() error {
 // The caller should wait for the returned channel to signal completion.
 func (fs *fuseFS) StopAsync() <-chan error {
 	errChan := make(chan error, 1)
-	
+
 	go func() {
 		errChan <- fs.Stop()
 	}()
-	
+
 	return errChan
 }
 
@@ -311,7 +349,7 @@ func (fs *fuseFS) ForceUnmount() error {
 		fs.mounted = false
 		return nil
 	}
-	
+
 	return fmt.Errorf("force unmount not implemented for %s", runtime.GOOS)
 }
 
@@ -328,7 +366,7 @@ func (fs *fuseFS) Mounted() bool {
 func (fs *fuseFS) HasActiveUploads() bool {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	
+
 	for _, sf := range fs.stagedFiles {
 		if atomic.LoadInt32(&sf.openRef) > 0 {
 			return true
@@ -342,7 +380,7 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 	defer fs.mu.Unlock()
 
 	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
-	
+
 	// MVP limitation: only one staged file at a time
 	// Clear tileRef for all previous staged files (but don't close if they have active uploads)
 	for existingID, sff := range fs.stagedFiles {
@@ -351,7 +389,7 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 		// Try to evict immediately if no active FUSE handles
 		fs.tryEvictLocked(existingID)
 	}
-	
+
 	sf := &StagedFile{
 		ID:           id,
 		FileID:       fileID,
@@ -391,12 +429,12 @@ func (fs *fuseFS) GetFilePath(stagedFile *StagedFile) string {
 func (fs *fuseFS) EvictStagedFile(id string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	
+
 	sff, exists := fs.stagedFiles[id]
 	if !exists {
 		return nil
 	}
-	
+
 	// Clear tileRef and try to evict
 	log.Printf("EvictStagedFile: Clearing tileRef for %s", id)
 	atomic.StoreInt32(&sff.tileRef, 0)
@@ -407,7 +445,7 @@ func (fs *fuseFS) EvictStagedFile(id string) error {
 func (fs *fuseFS) EvictAllStagedFiles() error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	
+
 	// Clear tileRef for all staged files and try to evict each
 	for id, sff := range fs.stagedFiles {
 		log.Printf("EvictAllStagedFiles: Clearing tileRef for %s", id)
@@ -424,10 +462,10 @@ func (fs *fuseFS) tryEvictLocked(id string) {
 	if !exists {
 		return
 	}
-	
+
 	tileRef := atomic.LoadInt32(&sff.tileRef)
 	openRef := atomic.LoadInt32(&sff.openRef)
-	
+
 	// Only evict if both refs are 0
 	if tileRef == 0 && openRef == 0 {
 		log.Printf("tryEvictLocked: Both refs are 0, evicting %s", id)
@@ -444,7 +482,7 @@ func (fs *fuseFS) doEvictLocked(id string) {
 	if !exists {
 		return
 	}
-	
+
 	// Close the BackingStore if it exists
 	sff.storeMu.Lock()
 	if sff.store != nil {
@@ -455,7 +493,7 @@ func (fs *fuseFS) doEvictLocked(id string) {
 		sff.store = nil
 	}
 	sff.storeMu.Unlock()
-	
+
 	// Remove from registry
 	delete(fs.stagedFiles, id)
 	log.Printf("doEvictLocked: Removed %s from registry", id)
@@ -488,6 +526,7 @@ func (fs *fuseFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *fuseFS) Access(path string, mask uint32) int {
+	defer fs.watchdog.enter("Access")()
 	defer logging.FUSETrace("Access", "path=%s mask=%d", path, mask)()
 	stat := &fuse.Stat_t{}
 	result := fs.Getattr(path, stat, 0)
@@ -501,13 +540,14 @@ func (fs *fuseFS) Access(path string, mask uint32) int {
 }
 
 func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	defer fs.watchdog.enter("Getattr")()
 	defer logging.FUSETrace("Getattr", "path=%s fh=%d", path, fh)()
 	path = strings.TrimPrefix(path, "/")
-	
+
 	// Set ownership to current user (prevents root ownership and admin:/// prompts)
 	stat.Uid = uint32(os.Getuid())
 	stat.Gid = uint32(os.Getgid())
-	
+
 	// Root directory
 	if path == "" {
 		stat.Mode = fuse.S_IFDIR | 0755
@@ -525,13 +565,13 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	// Check if it's a staged file subdirectory or file
 	if strings.HasPrefix(path, stagedDirName+"/") {
 		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
-		
+
 		if len(parts) == 1 {
 			// Subdirectory (e.g., Staged/fileid_recipient)
 			fs.mu.RLock()
 			_, exists := fs.stagedFiles[parts[0]]
 			fs.mu.RUnlock()
-			
+
 			if exists {
 				stat.Mode = fuse.S_IFDIR | 0755
 				stat.Nlink = 2
@@ -542,7 +582,7 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 			fs.mu.RLock()
 			sf, exists := fs.stagedFiles[parts[0]]
 			fs.mu.RUnlock()
-			
+
 			if exists && sf.FileName == parts[1] {
 				stat.Mode = fuse.S_IFREG | 0644
 				stat.Nlink = 1
@@ -559,44 +599,64 @@ func (fs *fuseFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 }
 
 func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+	defer fs.watchdog.enter("Readdir")()
 	defer logging.FUSETrace("Readdir", "path=%s ofst=%d fh=%d", path, ofst, fh)()
 	path = strings.TrimPrefix(path, "/")
 
 	// Root directory - show Staged/
 	if path == "" {
-		fill(".", nil, 0)
-		fill("..", nil, 0)
-		fill(stagedDirName, nil, 0)
+		if !fill(".", nil, 0) {
+			return 0
+		}
+		if !fill("..", nil, 0) {
+			return 0
+		}
+		if !fill(stagedDirName, nil, 0) {
+			return 0
+		}
 		return 0
 	}
 
 	// Staged directory - show all staged file subdirectories
 	if path == stagedDirName {
-		fill(".", nil, 0)
-		fill("..", nil, 0)
-		
+		if !fill(".", nil, 0) {
+			return 0
+		}
+		if !fill("..", nil, 0) {
+			return 0
+		}
+
 		fs.mu.RLock()
 		for id := range fs.stagedFiles {
-			fill(id, nil, 0)
+			if !fill(id, nil, 0) {
+				fs.mu.RUnlock()
+				return 0
+			}
 		}
 		fs.mu.RUnlock()
-		
+
 		return 0
 	}
 
 	// Staged file subdirectory - show the file
 	if strings.HasPrefix(path, stagedDirName+"/") {
 		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
-		
+
 		if len(parts) == 1 {
 			fs.mu.RLock()
 			sf, exists := fs.stagedFiles[parts[0]]
 			fs.mu.RUnlock()
-			
+
 			if exists {
-				fill(".", nil, 0)
-				fill("..", nil, 0)
-				fill(sf.FileName, nil, 0)
+				if !fill(".", nil, 0) {
+					return 0
+				}
+				if !fill("..", nil, 0) {
+					return 0
+				}
+				if !fill(sf.FileName, nil, 0) {
+					return 0
+				}
 				return 0
 			}
 		}
@@ -606,18 +666,19 @@ func (fs *fuseFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 }
 
 func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
+	defer fs.watchdog.enter("Open")()
 	defer logging.FUSETrace("Open", "path=%s flags=%d", path, flags)()
 	path = strings.TrimPrefix(path, "/")
-	
+
 	// Check if it's a staged file
 	if strings.HasPrefix(path, stagedDirName+"/") {
 		parts := strings.Split(strings.TrimPrefix(path, stagedDirName+"/"), "/")
-		
+
 		if len(parts) == 2 {
 			fs.mu.RLock()
 			sf, exists := fs.stagedFiles[parts[0]]
 			fs.mu.RUnlock()
-			
+
 			if exists && sf.FileName == parts[1] {
 				// Check if BackingStore needs initialization (without holding lock during I/O)
 				sf.storeMu.Lock()
@@ -626,12 +687,13 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 					log.Printf("Open: Backing store needs initialization for %s", sf.FileName)
 				}
 				sf.storeMu.Unlock()
-				
+
 				// If initialization is needed, do it WITHOUT holding the lock
 				if needsInit {
 					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
-					
+
 					// Build temp URL (network I/O - must not hold locks)
+					// Note: BuildTempURL is typically fast (just builds a URL), so no timeout needed
 					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
 					if err != nil {
 						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
@@ -660,7 +722,10 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 						storeOpts.CacheSize = 8
 					}
 
-					// Create backing store (may do I/O - must not hold locks)
+					// CRITICAL: Use fs.ctx (NOT a timeout context) for BackingStore
+					// The BackingStore spawns long-running goroutines (e.g., TempFileStore downloader)
+					// that need to run until the store is closed, not just during Open()
+					// The timeout protection happens in Read() where each read has a 15-second timeout
 					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
 					if err != nil {
 						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
@@ -684,7 +749,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 					}
 					sf.storeMu.Unlock()
 				}
-				
+
 				// Increment refs and register file handle (hold locks briefly)
 				sf.storeMu.Lock()
 				if sf.store == nil {
@@ -696,7 +761,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				stagedID := sf.ID
 				store := sf.store
 				sf.storeMu.Unlock()
-				
+
 				fs.fhMu.Lock()
 				fh := fs.nextFH
 				fs.nextFH++
@@ -705,16 +770,16 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				fs.fhToStagedID[fh] = stagedID
 				isFirstHandle := len(fs.fhToStore) == 1
 				fs.fhMu.Unlock()
-				
+
 				// Enable sleep prevention on first file handle (async to avoid blocking)
 				if isFirstHandle {
 					go fs.enableSleepPrevention()
 				}
-				
+
 				tileRef := atomic.LoadInt32(&sf.tileRef)
-				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
+				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)",
 					sf.FileName, fh, tileRef, newOpenRef, store.RefCount())
-				
+
 				return 0, fh
 			}
 		}
@@ -724,29 +789,45 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	defer fs.watchdog.enter("Read")()
 	defer logging.FUSETrace("Read", "fh=%d off=%d len=%d", fh, ofst, len(buff))()
-	
+
 	// Get the backing store from the file handle (release lock immediately)
 	fs.fhMu.RLock()
 	store, exists := fs.fhToStore[fh]
 	fs.fhMu.RUnlock()
-	
+
 	if !exists || store == nil {
 		log.Printf("Read: Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
 
+	// CRITICAL: Use timeout-bounded context to prevent indefinite blocking
+	// If the backing store's network I/O stalls, this ensures we return an error
+	// rather than blocking the FUSE callback forever
+	ctx, cancel := context.WithTimeout(fs.ctx, 15*time.Second)
+	defer cancel()
+
 	// Perform the actual read (no locks held - this is I/O bound)
-	n, err := store.ReadAt(fs.ctx, buff, ofst)
-	
-	// Handle EOF correctly
+	n, err := store.ReadAt(ctx, buff, ofst)
+
+	// Handle EOF correctly: if we got data and EOF, return the data
 	if err != nil {
 		if errors.Is(err, io.EOF) {
+			// EOF handling bug fix: if n>0 && err==io.EOF, return n (not 0)
+			// This is the correct behavior: we got some data before hitting EOF
+			if n > 0 {
+				return n
+			}
 			return 0
 		}
-		// For other errors, only fail if we read nothing
+		// For other errors (including timeout), only fail if we read nothing
 		if n == 0 {
-			log.Printf("Read: I/O error at fh=%d off=%d: %v", fh, ofst, err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Read: Timeout at fh=%d off=%d after 15s", fh, ofst)
+			} else {
+				log.Printf("Read: I/O error at fh=%d off=%d: %v", fh, ofst, err)
+			}
 			return -fuse.EIO
 		}
 		// If we got some data despite error, return the data (partial read)
@@ -756,8 +837,9 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *fuseFS) Release(path string, fh uint64) int {
+	defer fs.watchdog.enter("Release")()
 	defer logging.FUSETrace("Release", "fh=%d", fh)()
-	
+
 	// Get and remove the file handle mapping
 	fs.fhMu.Lock()
 	store, exists := fs.fhToStore[fh]
@@ -766,38 +848,69 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	delete(fs.fhToPath, fh)
 	delete(fs.fhToStagedID, fh)
 	fs.fhMu.Unlock()
-	
+
 	if !exists || store == nil {
 		log.Printf("Release: Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
-	
+
 	// Decrement both BackingStore refCount and openRef
 	newStoreRefCount := store.DecRef()
-	
+
 	// Decrement openRef and check if we should evict
 	fs.mu.RLock()
 	sff, sfExists := fs.stagedFiles[stagedID]
 	fs.mu.RUnlock()
-	
+
 	if sfExists {
 		newOpenRef := atomic.AddInt32(&sff.openRef, -1)
 		tileRef := atomic.LoadInt32(&sff.tileRef)
-		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)", 
+		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)",
 			fh, tileRef, newOpenRef, newStoreRefCount)
-		
-		// If both refs are 0, try to evict
+
+		// If both refs are 0, try to evict (but skip if debug flag is set)
 		if tileRef == 0 && newOpenRef == 0 {
-			log.Printf("Release: Both refs are 0 for %s, attempting eviction", stagedID)
-			fs.mu.Lock()
-			fs.tryEvictLocked(stagedID)
-			fs.mu.Unlock()
+			if fs.config.DebugSkipEviction {
+				log.Printf("Release: Both refs are 0 for %s, but skipping eviction (debugSkipEviction=true)", stagedID)
+			} else {
+				log.Printf("Release: Both refs are 0 for %s, attempting non-blocking eviction", stagedID)
+				// CRITICAL: Make eviction non-blocking to prevent Release from blocking
+				// Detach the store from the registry without holding locks across Close()
+				fs.mu.Lock()
+				sff, ok := fs.stagedFiles[stagedID]
+				if ok {
+					// Grab the store and remove from map WITHOUT closing under the lock
+					sff.storeMu.Lock()
+					storeToClose := sff.store
+					sff.store = nil
+					delete(fs.stagedFiles, stagedID)
+					sff.storeMu.Unlock()
+					fs.mu.Unlock()
+
+					// Close in background with a timeout-aware context
+					// This ensures Close() can't block the FUSE worker thread
+					if storeToClose != nil {
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+							log.Printf("Release: Closing BackingStore for %s in background", stagedID)
+							if err := storeToClose.CloseWithContext(ctx); err != nil {
+								log.Printf("Release: Error closing store for %s: %v", stagedID, err)
+							} else {
+								log.Printf("Release: BackingStore closed successfully for %s", stagedID)
+							}
+						}()
+					}
+				} else {
+					fs.mu.Unlock()
+				}
+			}
 		}
 	} else {
-		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
+		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists",
 			fh, newStoreRefCount)
 	}
-	
+
 	// Disable sleep prevention if this was the last file handle (async to avoid blocking)
 	go fs.disableSleepPrevention()
 
@@ -910,18 +1023,18 @@ func (fs *fuseFS) Mknod(path string, mode uint32, dev uint64) int {
 func (fs *fuseFS) enableSleepPrevention() {
 	fs.sleepMu.Lock()
 	defer fs.sleepMu.Unlock()
-	
+
 	// Only enable if not already enabled
 	if fs.sleepRelease != nil {
 		return
 	}
-	
+
 	release, err := sleep.PreventSleep()
 	if err != nil {
 		log.Printf("[fs] Warning: failed to enable sleep prevention: %v", err)
 		return
 	}
-	
+
 	fs.sleepRelease = release
 }
 
@@ -929,16 +1042,16 @@ func (fs *fuseFS) enableSleepPrevention() {
 func (fs *fuseFS) disableSleepPrevention() {
 	fs.sleepMu.Lock()
 	defer fs.sleepMu.Unlock()
-	
+
 	if fs.sleepRelease == nil {
 		return
 	}
-	
+
 	// Check if there are any open file handles
 	fs.fhMu.RLock()
 	hasOpenHandles := len(fs.fhToStore) > 0
 	fs.fhMu.RUnlock()
-	
+
 	// Only disable if no file handles are open
 	if !hasOpenHandles {
 		fs.sleepRelease()
@@ -952,18 +1065,18 @@ func (fs *fuseFS) disableSleepPrevention() {
 func (fs *fuseFS) enableAppNapPrevention() {
 	fs.appNapMu.Lock()
 	defer fs.appNapMu.Unlock()
-	
+
 	// Only enable if not already enabled
 	if fs.appNapRelease != nil {
 		return
 	}
-	
+
 	release, err := appnap.PreventAppNap("Active FUSE filesystem")
 	if err != nil {
 		log.Printf("[fs] Warning: failed to enable App Nap prevention: %v", err)
 		return
 	}
-	
+
 	fs.appNapRelease = release
 	log.Printf("[fs] App Nap prevention enabled (filesystem mounted)")
 }
@@ -972,11 +1085,11 @@ func (fs *fuseFS) enableAppNapPrevention() {
 func (fs *fuseFS) disableAppNapPrevention() {
 	fs.appNapMu.Lock()
 	defer fs.appNapMu.Unlock()
-	
+
 	if fs.appNapRelease == nil {
 		return
 	}
-	
+
 	fs.appNapRelease()
 	fs.appNapRelease = nil
 	log.Printf("[fs] App Nap prevention disabled (filesystem unmounted)")

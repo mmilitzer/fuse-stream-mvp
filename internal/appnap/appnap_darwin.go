@@ -20,13 +20,15 @@ void FSMVP_InitActivityTokens() {
 
 // BeginActivity creates an activity token to prevent App Nap.
 // Returns an integer ID (index) for the token, or -1 on error.
+// NOTE: No NSLog calls here to avoid GCD deadlocks when called from FUSE callbacks.
+// Error reporting is done via return codes only.
 int FSMVP_BeginActivity(const char *reasonCStr) {
     FSMVP_InitActivityTokens();
     
     @autoreleasepool {
         NSString *reason = [NSString stringWithUTF8String:reasonCStr];
         if (!reason) {
-            NSLog(@"[appnap] Failed to create reason string");
+            // Don't use NSLog - it can trigger dispatch_sync and deadlock
             return -1;
         }
         
@@ -42,15 +44,14 @@ int FSMVP_BeginActivity(const char *reasonCStr) {
         id<NSObject> token = [[NSProcessInfo processInfo] beginActivityWithOptions:options
                                                                              reason:reason];
         if (!token) {
-            NSLog(@"[appnap] Failed to create activity token");
+            // Don't use NSLog - it can trigger dispatch_sync and deadlock
             return -1;
         }
         
         @synchronized(activityTokens) {
             [activityTokens addObject:token];
             NSUInteger idx = [activityTokens count] - 1;
-            NSLog(@"[appnap] Activity started (token ID: %lu, reason: %@)", 
-                  (unsigned long)idx, reason);
+            // Don't use NSLog - logging is done in Go layer
             return (int)idx;
         }
     }
@@ -58,25 +59,26 @@ int FSMVP_BeginActivity(const char *reasonCStr) {
 
 // EndActivity releases an activity token.
 // Returns 0 on success, -1 on error.
+// NOTE: No NSLog calls here to avoid GCD deadlocks when called from FUSE callbacks.
 int FSMVP_EndActivity(int tokenID) {
     FSMVP_InitActivityTokens();
     
     @autoreleasepool {
         @synchronized(activityTokens) {
             if (tokenID < 0 || tokenID >= [activityTokens count]) {
-                NSLog(@"[appnap] Invalid token ID: %d", tokenID);
+                // Don't use NSLog - it can trigger dispatch_sync and deadlock
                 return -1;
             }
             
             id<NSObject> token = [activityTokens objectAtIndex:tokenID];
             if (!token || token == [NSNull null]) {
-                NSLog(@"[appnap] Token already released: %d", tokenID);
+                // Don't use NSLog - it can trigger dispatch_sync and deadlock
                 return -1;
             }
             
             [[NSProcessInfo processInfo] endActivity:token];
             [activityTokens replaceObjectAtIndex:tokenID withObject:[NSNull null]];
-            NSLog(@"[appnap] Activity ended (token ID: %d)", tokenID);
+            // Don't use NSLog - logging is done in Go layer
             return 0;
         }
     }

@@ -77,7 +77,7 @@ func (fs *stubFS) GetStagedFiles() []*StagedFile {
 }
 
 func (fs *stubFS) GetFilePath(sf *StagedFile) string {
-	return fmt.Sprintf("(FUSE unavailable - build with -tags fuse)")
+	return "(FUSE unavailable - build with -tags fuse)"
 }
 
 func (fs *stubFS) EvictStagedFile(id string) error {

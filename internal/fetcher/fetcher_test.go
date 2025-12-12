@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // testServer wraps httptest.Server with request tracking
@@ -462,6 +463,8 @@ func TestFetcher_CacheEfficiency(t *testing.T) {
 		t.Fatalf("First ReadAt error = %v", err)
 	}
 
+	// Small delay to let prefetch goroutines settle
+	time.Sleep(100 * time.Millisecond)
 	requestsAfterFirst, _ := ts.stats()
 
 	// Read the same region again (should hit cache)

@@ -111,16 +111,16 @@ func (f *Fetcher) ReadAt(ctx context.Context, buf []byte, offset int64) (int, er
 
 func (f *Fetcher) getChunk(ctx context.Context, offset int64) ([]byte, error) {
 	// Check cache first
-	f.cacheMu.RLock()
+	f.cacheMu.Lock()
 	if c, ok := f.cache[offset]; ok {
-		f.cacheMu.RUnlock()
+		f.updateLRU(offset) // Must be called with lock held
+		f.cacheMu.Unlock()
 		if c.err != nil {
 			return nil, c.err
 		}
-		f.updateLRU(offset)
 		return c.data, nil
 	}
-	f.cacheMu.RUnlock()
+	f.cacheMu.Unlock()
 
 	// Check if another goroutine is already fetching this chunk
 	f.activeReadsMu.Lock()
