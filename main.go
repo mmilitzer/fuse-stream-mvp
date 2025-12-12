@@ -81,4 +81,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error launching app: %v", err)
 	}
+	
+	// Wait for daemon shutdown to complete before exiting
+	// This ensures temp files are cleaned up and filesystem is properly unmounted
+	daemon.WaitForShutdown()
 }
