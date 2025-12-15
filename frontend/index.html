@@ -425,6 +425,17 @@
             document.getElementById('drag-tile').style.display = 'none';
             document.getElementById('staged-path').style.display = 'none';
             document.getElementById('recipient-input').value = '';
+            
+            // Update back button based on whether job has multiple outputs
+            const backButton = document.getElementById('btn-back-to-outputs');
+            if (selectedJob && selectedJob.outputs && selectedJob.outputs.length > 1) {
+                backButton.textContent = '← Back to Outputs';
+                backButton.onclick = () => showOutputs(selectedJob);
+            } else {
+                backButton.textContent = '← Back to Jobs';
+                backButton.onclick = () => showScreen('screen-jobs');
+            }
+            
             showScreen('screen-recipient');
         }
 
@@ -510,7 +521,7 @@
         document.getElementById('btn-search').onclick = doSearch;
         document.getElementById('btn-clear-search').onclick = clearSearch;
         document.getElementById('btn-back-to-jobs').onclick = () => showScreen('screen-jobs');
-        document.getElementById('btn-back-to-outputs').onclick = () => showOutputs(selectedJob);
+        // btn-back-to-outputs onclick is set dynamically in showRecipientScreen()
         document.getElementById('btn-stage').onclick = stageForUpload;
 
         // Enter key on search input
