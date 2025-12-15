@@ -104,6 +104,17 @@ func (fs *fuseFS) Start(opts MountOptions) error {
 		fs.watchdog.dumpStacks()
 	})
 
+	// Clean up stale temp files from previous runs
+	tempDir := fs.config.TempDir
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	tempManager := fetcher.GetTempFileManager(tempDir)
+	if err := tempManager.CleanupStaleFiles(); err != nil {
+		log.Printf("[fs] Warning: failed to cleanup stale temp files: %v", err)
+		// Continue anyway - this is not a fatal error
+	}
+
 	// Attempt mount recovery on macOS
 	if runtime.GOOS == "darwin" {
 		if err := fs.recoverStaleMountMacOS(); err != nil {
@@ -283,7 +294,8 @@ func (fs *fuseFS) Stop() error {
 		fs.watchdog.stop()
 	}
 
-	// Evict all staged files to clean up BackingStores
+	// Evict all staged files to clean up BackingStores early
+	// This closes the backing stores which will close temp files
 	if err := fs.EvictAllStagedFiles(); err != nil {
 		log.Printf("[fs] Error evicting staged files: %v", err)
 	}
@@ -293,7 +305,7 @@ func (fs *fuseFS) Stop() error {
 	if fs.appNapRelease != nil {
 		fs.appNapRelease()
 		fs.appNapRelease = nil
-		log.Println("[fs] App Nap prevention released")
+		log.Println("[appnap] App Nap prevention released")
 	}
 	fs.appNapMu.Unlock()
 
@@ -302,7 +314,7 @@ func (fs *fuseFS) Stop() error {
 	if fs.sleepRelease != nil {
 		fs.sleepRelease()
 		fs.sleepRelease = nil
-		log.Println("[fs] Sleep prevention released")
+		log.Println("[sleep] Sleep prevention released")
 	}
 	fs.sleepMu.Unlock()
 
@@ -318,7 +330,19 @@ func (fs *fuseFS) Stop() error {
 		}
 		log.Println("[fs] Filesystem unmounted successfully")
 	}
-	fs.mounted = false
+
+	// Clean up all temp files from TempFileManager
+	// Do this AFTER unmount to ensure all file handles are closed
+	tempDir := fs.config.TempDir
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	tempManager := fetcher.GetTempFileManager(tempDir)
+	if err := tempManager.CleanupAllFiles(); err != nil {
+		log.Printf("[fs] Warning: error cleaning up temp files: %v", err)
+		// Continue with shutdown even if cleanup fails
+	}
+
 	return nil
 }
 
@@ -376,20 +400,127 @@ func (fs *fuseFS) HasActiveUploads() bool {
 }
 
 func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, contentType string) (*StagedFile, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
 	id := fmt.Sprintf("%s_%s", fileID, recipientTag)
 
 	// MVP limitation: only one staged file at a time
 	// Clear tileRef for all previous staged files (but don't close if they have active uploads)
+	fs.mu.Lock()
 	for existingID, sff := range fs.stagedFiles {
 		log.Printf("StageFile: Clearing tileRef for previous staged file %s", existingID)
 		atomic.StoreInt32(&sff.tileRef, 0)
 		// Try to evict immediately if no active FUSE handles
 		fs.tryEvictLocked(existingID)
 	}
+	fs.mu.Unlock()
 
+	// Check if this file is already staged (quick check without lock)
+	fs.mu.RLock()
+	existingSff, exists := fs.stagedFiles[id]
+	fs.mu.RUnlock()
+
+	if exists {
+		// File already staged - check if BackingStore is valid
+		existingSff.storeMu.Lock()
+		storeValid := existingSff.store != nil
+		if storeValid {
+			// Check if temp file was evicted (TempFileManager sets evicted flag via callback)
+			if tempStore, ok := existingSff.store.(*fetcher.TempFileStore); ok && tempStore.IsEvicted() {
+				log.Printf("[fs] StageFile: File %s BackingStore was evicted, will re-create", id)
+				// Close the evicted store
+				existingSff.store.Close()
+				existingSff.store = nil
+				storeValid = false
+			}
+		}
+		existingSff.storeMu.Unlock()
+
+		atomic.StoreInt32(&existingSff.tileRef, 1)
+		existingSff.ModTime = time.Now()
+
+		if storeValid {
+			log.Printf("[fs] StageFile: File %s already staged with valid BackingStore, resetting tileRef=1", id)
+			return existingSff.StagedFile, nil
+		}
+		// Fall through to create new store
+		log.Printf("[fs] StageFile: File %s already staged but BackingStore needs re-creation", id)
+	}
+
+	// For new files or files needing store re-creation, check disk space FIRST
+	// This ensures we don't block FUSE operations later
+	// Only check for temp-file mode, not range-lru mode
+	if fs.config.FetchMode == "temp-file" {
+		tempDir := fs.config.TempDir
+		if tempDir == "" {
+			tempDir = os.TempDir()
+		}
+
+		tempManager := fetcher.GetTempFileManager(tempDir)
+
+		// Try to ensure space is available (will evict old files if needed)
+		// This can do disk I/O but it's OK here since we're NOT in a FUSE callback
+		if err := tempManager.EnsureSpaceAvailable(size); err != nil {
+			// If we can't free enough space, return a user-friendly error
+			log.Printf("[fs] StageFile: Insufficient disk space for %s (%d bytes): %v", fileName, size, err)
+			return nil, fmt.Errorf("insufficient disk space: %w", err)
+		}
+		log.Printf("[fs] StageFile: Disk space check passed for %s (%d bytes)", fileName, size)
+	}
+
+	// Build temp URL (network I/O - but OK here since we're NOT in FUSE callback)
+	tempURL, err := fs.client.BuildTempURL(fileID, recipientTag)
+	if err != nil {
+		log.Printf("[fs] StageFile: Failed to build temp URL for %s: %v", fileName, err)
+		return nil, fmt.Errorf("failed to build temp URL: %w", err)
+	}
+	log.Printf("[fs] StageFile: Got temp URL for %s", fileName)
+
+	// Create store options from config
+	storeOpts := fetcher.StoreOptions{
+		Mode:                  fetcher.FetchMode(fs.config.FetchMode),
+		TempDir:               fs.config.TempDir,
+		ChunkSize:             fs.config.ChunkSize,
+		MaxConcurrentRequests: fs.config.MaxConcurrentRequests,
+		CacheSize:             fs.config.CacheSize,
+	}
+	if storeOpts.ChunkSize == 0 {
+		storeOpts.ChunkSize = 4 * 1024 * 1024 // 4MB default
+	}
+	if storeOpts.MaxConcurrentRequests == 0 {
+		storeOpts.MaxConcurrentRequests = 4
+	}
+	if storeOpts.CacheSize == 0 {
+		storeOpts.CacheSize = 8
+	}
+
+	// Create backing store (may do I/O - but OK here since we're NOT in FUSE callback)
+	store, err := fetcher.NewBackingStore(fs.ctx, tempURL, size, storeOpts)
+	if err != nil {
+		log.Printf("[fs] StageFile: Failed to create backing store for %s: %v", fileName, err)
+		return nil, fmt.Errorf("failed to create backing store: %w", err)
+	}
+	log.Printf("[fs] StageFile: Backing store created for %s (mode=%s)", fileName, storeOpts.Mode)
+
+	// Now update the file with the new store
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if exists {
+		// Update existing file with new store
+		existingSff.storeMu.Lock()
+		if existingSff.store != nil {
+			// Someone else created a store, close ours
+			store.Close()
+			log.Printf("[fs] StageFile: Another caller created store for %s, discarding duplicate", id)
+		} else {
+			existingSff.store = store
+			existingSff.Status = "ready"
+			log.Printf("[fs] StageFile: Updated existing file %s with new store", id)
+		}
+		existingSff.storeMu.Unlock()
+		return existingSff.StagedFile, nil
+	}
+
+	// Create new staged file with store already initialized
 	sf := &StagedFile{
 		ID:           id,
 		FileID:       fileID,
@@ -398,16 +529,18 @@ func (fs *fuseFS) StageFile(fileID, fileName, recipientTag string, size int64, c
 		Size:         size,
 		ContentType:  contentType,
 		ModTime:      time.Now(),
-		Status:       "idle",
+		Status:       "ready", // Store is ready!
 	}
-
+	
 	sff := &stagedFileFuse{
 		StagedFile: sf,
+		store:      store,
 		tileRef:    1, // Tile is now visible
 		openRef:    0, // No FUSE handles yet
 	}
 	fs.stagedFiles[id] = sff
-	log.Printf("StageFile: Staged new file %s (fileID=%s, recipient=%s, tileRef=1, openRef=0)", fileName, fileID, recipientTag)
+	log.Printf("[fs] StageFile: Staged new file %s with ready store (fileID=%s, recipient=%s, tileRef=1, openRef=0, total staged=%d)", 
+		fileName, fileID, recipientTag, len(fs.stagedFiles))
 	return sf, nil
 }
 
@@ -680,86 +813,30 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 			fs.mu.RUnlock()
 
 			if exists && sf.FileName == parts[1] {
-				// Check if BackingStore needs initialization (without holding lock during I/O)
+				// Check if BackingStore is ready (quick check without lock during I/O)
 				sf.storeMu.Lock()
-				needsInit := (sf.store == nil)
-				if needsInit {
-					log.Printf("Open: Backing store needs initialization for %s", sf.FileName)
-				}
+				store := sf.store
 				sf.storeMu.Unlock()
-
-				// If initialization is needed, do it WITHOUT holding the lock
-				if needsInit {
-					log.Printf("Open: Initializing backing store for %s (fileID=%s, size=%d)", sf.FileName, sf.FileID, sf.Size)
-
-					// Build temp URL (network I/O - must not hold locks)
-					// Note: BuildTempURL is typically fast (just builds a URL), so no timeout needed
-					tempURL, err := fs.client.BuildTempURL(sf.FileID, sf.RecipientTag)
-					if err != nil {
-						log.Printf("Failed to build temp URL for %s: %v", sf.FileName, err)
-						sf.storeMu.Lock()
-						sf.Status = "error"
-						sf.storeMu.Unlock()
-						return -fuse.EIO, ^uint64(0)
-					}
-					log.Printf("Open: Got temp URL for %s: %s", sf.FileName, tempURL)
-
-					// Create store options from config
-					storeOpts := fetcher.StoreOptions{
-						Mode:                  fetcher.FetchMode(fs.config.FetchMode),
-						TempDir:               fs.config.TempDir,
-						ChunkSize:             fs.config.ChunkSize,
-						MaxConcurrentRequests: fs.config.MaxConcurrentRequests,
-						CacheSize:             fs.config.CacheSize,
-					}
-					if storeOpts.ChunkSize == 0 {
-						storeOpts.ChunkSize = 4 * 1024 * 1024 // 4MB default
-					}
-					if storeOpts.MaxConcurrentRequests == 0 {
-						storeOpts.MaxConcurrentRequests = 4
-					}
-					if storeOpts.CacheSize == 0 {
-						storeOpts.CacheSize = 8
-					}
-
-					// CRITICAL: Use fs.ctx (NOT a timeout context) for BackingStore
-					// The BackingStore spawns long-running goroutines (e.g., TempFileStore downloader)
-					// that need to run until the store is closed, not just during Open()
-					// The timeout protection happens in Read() where each read has a 15-second timeout
-					store, err := fetcher.NewBackingStore(fs.ctx, tempURL, sf.Size, storeOpts)
-					if err != nil {
-						log.Printf("Failed to create backing store for %s: %v", sf.FileName, err)
-						sf.storeMu.Lock()
-						sf.Status = "error"
-						sf.storeMu.Unlock()
-						return -fuse.EIO, ^uint64(0)
-					}
-
-					// Now atomically update the store (quick lock)
-					sf.storeMu.Lock()
-					if sf.store == nil {
-						// We won the race, use our store
-						sf.store = store
-						sf.Status = "open"
-						log.Printf("Open: Backing store initialized successfully for %s (mode=%s)", sf.FileName, storeOpts.Mode)
-					} else {
-						// Someone else initialized it, close ours
-						store.Close()
-						log.Printf("Open: Backing store was initialized by another caller, discarding duplicate")
-					}
-					sf.storeMu.Unlock()
+				
+				if store == nil {
+					// Store not ready - this should not happen if StageFile() was called properly
+					// Return EIO (I/O error) since the file was not properly prepared
+					logging.FUSELog("[Open] ERROR: Backing store not ready for %s - file not properly staged", sf.FileName)
+					return -fuse.EIO, ^uint64(0)
+				}
+				
+				// Check if store was evicted
+				if tempStore, ok := store.(*fetcher.TempFileStore); ok && tempStore.IsEvicted() {
+					logging.FUSELog("[Open] ERROR: Backing store was evicted for %s - file needs re-staging", sf.FileName)
+					return -fuse.EIO, ^uint64(0)
 				}
 
 				// Increment refs and register file handle (hold locks briefly)
 				sf.storeMu.Lock()
-				if sf.store == nil {
-					sf.storeMu.Unlock()
-					return -fuse.EIO, ^uint64(0)
-				}
 				newOpenRef := atomic.AddInt32(&sf.openRef, 1)
-				sf.store.IncRef()
+				store.IncRef()
 				stagedID := sf.ID
-				store := sf.store
+				sf.Status = "open"
 				sf.storeMu.Unlock()
 
 				fs.fhMu.Lock()
@@ -777,7 +854,7 @@ func (fs *fuseFS) Open(path string, flags int) (int, uint64) {
 				}
 
 				tileRef := atomic.LoadInt32(&sf.tileRef)
-				log.Printf("Open: %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)",
+				logging.FUSELog("[Open] %s opened (fh=%d, tileRef=%d, openRef=%d, storeRefCount=%d)", 
 					sf.FileName, fh, tileRef, newOpenRef, store.RefCount())
 
 				return 0, fh
@@ -798,7 +875,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	fs.fhMu.RUnlock()
 
 	if !exists || store == nil {
-		log.Printf("Read: Invalid file handle %d", fh)
+		logging.FUSELog("[Read] Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
 
@@ -823,11 +900,7 @@ func (fs *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 		}
 		// For other errors (including timeout), only fail if we read nothing
 		if n == 0 {
-			if errors.Is(err, context.DeadlineExceeded) {
-				log.Printf("Read: Timeout at fh=%d off=%d after 15s", fh, ofst)
-			} else {
-				log.Printf("Read: I/O error at fh=%d off=%d: %v", fh, ofst, err)
-			}
+			logging.FUSELog("[Read] I/O error at fh=%d off=%d: %v", fh, ofst, err)
 			return -fuse.EIO
 		}
 		// If we got some data despite error, return the data (partial read)
@@ -850,7 +923,7 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	fs.fhMu.Unlock()
 
 	if !exists || store == nil {
-		log.Printf("Release: Invalid file handle %d", fh)
+		logging.FUSELog("[Release] Invalid file handle %d", fh)
 		return -fuse.EBADF
 	}
 
@@ -865,49 +938,22 @@ func (fs *fuseFS) Release(path string, fh uint64) int {
 	if sfExists {
 		newOpenRef := atomic.AddInt32(&sff.openRef, -1)
 		tileRef := atomic.LoadInt32(&sff.tileRef)
-		log.Printf("Release: fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)",
+		logging.FUSELog("[Release] fh=%d closed (tileRef=%d, openRef=%d, storeRefCount=%d)", 
 			fh, tileRef, newOpenRef, newStoreRefCount)
 
 		// If both refs are 0, try to evict (but skip if debug flag is set)
 		if tileRef == 0 && newOpenRef == 0 {
 			if fs.config.DebugSkipEviction {
-				log.Printf("Release: Both refs are 0 for %s, but skipping eviction (debugSkipEviction=true)", stagedID)
+				logging.FUSELog("[Release] Both refs are 0 for %s, but skipping eviction (debugSkipEviction=true)", stagedID)
 			} else {
-				log.Printf("Release: Both refs are 0 for %s, attempting non-blocking eviction", stagedID)
-				// CRITICAL: Make eviction non-blocking to prevent Release from blocking
-				// Detach the store from the registry without holding locks across Close()
+				logging.FUSELog("[Release] Both refs are 0 for %s, attempting eviction", stagedID)
 				fs.mu.Lock()
-				sff, ok := fs.stagedFiles[stagedID]
-				if ok {
-					// Grab the store and remove from map WITHOUT closing under the lock
-					sff.storeMu.Lock()
-					storeToClose := sff.store
-					sff.store = nil
-					delete(fs.stagedFiles, stagedID)
-					sff.storeMu.Unlock()
-					fs.mu.Unlock()
-
-					// Close in background with a timeout-aware context
-					// This ensures Close() can't block the FUSE worker thread
-					if storeToClose != nil {
-						go func() {
-							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-							defer cancel()
-							log.Printf("Release: Closing BackingStore for %s in background", stagedID)
-							if err := storeToClose.CloseWithContext(ctx); err != nil {
-								log.Printf("Release: Error closing store for %s: %v", stagedID, err)
-							} else {
-								log.Printf("Release: BackingStore closed successfully for %s", stagedID)
-							}
-						}()
-					}
-				} else {
-					fs.mu.Unlock()
-				}
+				fs.tryEvictLocked(stagedID)
+				fs.mu.Unlock()
 			}
 		}
 	} else {
-		log.Printf("Release: fh=%d closed (storeRefCount=%d) - staged file no longer exists",
+		logging.FUSELog("[Release] fh=%d closed (storeRefCount=%d) - staged file no longer exists", 
 			fh, newStoreRefCount)
 	}
 

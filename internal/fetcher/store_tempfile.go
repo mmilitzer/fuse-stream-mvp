@@ -53,6 +53,7 @@ type TempFileStore struct {
 	// Reference counting and lifecycle
 	refCount atomic.Int32
 	closed   atomic.Bool
+	evicted  atomic.Bool // Set to true when TempFileManager evicts the file
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup // Tracks downloader goroutine
 }
@@ -63,11 +64,19 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		return nil, fmt.Errorf("invalid file size: %d", size)
 	}
 
-	// Create temp file
+	// Get temp directory
 	tempDir := opts.TempDir
 	if tempDir == "" {
 		tempDir = os.TempDir()
 	}
+	
+	// Get temp file manager and ensure space is available
+	manager := GetTempFileManager(tempDir)
+	if err := manager.EnsureSpaceAvailable(size); err != nil {
+		return nil, fmt.Errorf("ensure disk space: %w", err)
+	}
+
+	// Create temp file
 	tempFile, err := os.CreateTemp(tempDir, "fsmvp-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
@@ -98,6 +107,12 @@ func NewTempFileStore(ctx context.Context, url string, size int64, opts StoreOpt
 		notifyCh: make(chan struct{}, 100), // Buffered to avoid blocking downloader
 		readFile: readFile,
 	}
+
+	// Register with callback to mark as evicted when TempFileManager deletes the file
+	manager.Register(tempPath, size, func() {
+		log.Printf("[tempfile] BackingStore notified of eviction: %s", tempPath)
+		store.evicted.Store(true)
+	})
 
 	log.Printf("[TempFileStore #%d] Created for %s (size=%d) goid=%d", debugID, url, size, goroutineid.Get())
 
@@ -232,6 +247,16 @@ func (s *TempFileStore) RefCount() int32 {
 	return s.refCount.Load()
 }
 
+// TempPath returns the path to the temporary file.
+func (s *TempFileStore) TempPath() string {
+	return s.tempPath
+}
+
+// IsEvicted returns true if the temp file was evicted by TempFileManager.
+func (s *TempFileStore) IsEvicted() bool {
+	return s.evicted.Load()
+}
+
 // Close releases resources and deletes the temp file.
 func (s *TempFileStore) Close() error {
 	return s.CloseWithContext(context.Background())
@@ -304,7 +329,12 @@ func (s *TempFileStore) CloseWithContext(ctx context.Context) error {
 		s.readFile = nil
 	}
 
-	// Step 6: Remove temp file (best effort)
+	// Step 6: Unregister from TempFileManager
+	if manager := globalManager; manager != nil {
+		manager.Unregister(s.tempPath)
+	}
+
+	// Step 7: Remove temp file (best effort)
 	if err := os.Remove(s.tempPath); err != nil && !os.IsNotExist(err) {
 		log.Printf("[TempFileStore #%d] Warning: error removing temp file: %v goid=%d", s.debugID, err, goid)
 		return err
@@ -405,6 +435,12 @@ func (s *TempFileStore) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 
 	n, err := f.ReadAt(p, off)
+	
+	// Update access time in manager (this is quick, just updates a timestamp)
+	if manager := globalManager; manager != nil {
+		manager.UpdateAccess(s.tempPath)
+	}
+	
 	if err != nil {
 		// If we got some data but hit EOF, that's fine
 		if err == io.EOF && n > 0 && off+int64(n) <= s.size {
