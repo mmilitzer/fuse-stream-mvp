@@ -98,6 +98,9 @@ client_secret = "YOUR_CLIENT_SECRET"
 # Mount location (adjust to your username)
 mountpoint = "/Users/YourUsername/FuseStream"
 
+# Required for beta1 - single-threaded mode for stability
+debug_fskit_single_thread = true
+
 # Optional settings
 fetch_mode = "temp-file"
 temp_dir = "/tmp"
