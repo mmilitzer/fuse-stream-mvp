@@ -1,41 +1,226 @@
-# fuse-stream-mvp (Go + Wails + FUSE)
+# FuseStream - Fast Video Uploads for Xvid MediaHub
 
-Drag-to-upload for large videos without pre-downloading: a read-only virtual filesystem that streams from **Xvid MediaHub** over HTTP Range while the browser uploads.
+Upload large videos directly to websites without downloading them first. FuseStream creates a virtual file on your Mac that streams content from your Xvid MediaHub account, allowing browsers to upload videos while simultaneously streaming from the cloud. This means **uploads start immediately** and finish in roughly the same time as a direct download would take - saving both time and disk space.
 
-## Current Status: M3 (macOS-only MVP)
+## What Does It Do?
 
-**M3 is macOS-only** with production-ready features:
-- **macOS 15.4+** with **macFUSE FSKit backend** (no kext)
-- Robust Cocoa drag-and-drop (idempotent, validated, native NSEvent-based)
-- Automatic mount recovery (stale mount detection and cleanup)
-- **App Nap prevention** - prevents process throttling when app loses focus (critical for Finder-launch)
-- **Sleep prevention** during active transfers (IOPMAssertion - prevents system sleep)
-- **Persistent file logging** to ~/Library/Logs/FuseStream/fusestream.log (diagnosable without console)
-- **Lifecycle monitoring** - tracks foreground/background transitions and tests FS responsiveness
-- Dual-ref eviction system (tileRef + openRef)
-- Self-hosted macOS CI build
+FuseStream solves a common problem: you have large video files stored in Xvid MediaHub and need to upload them to another website (client portal, social media, cloud storage, etc.). Normally, you would:
+1. Download the entire video from MediaHub to your Mac (takes time, uses disk space)
+2. Wait for the download to complete
+3. Upload the file from your Mac to the destination site
 
-Linux support (M1/M2) has been removed in this milestone. Future cross-platform support may be reconsidered post-M3.
+**With FuseStream:**
+1. Select your video in the app
+2. Drag and drop into the website's upload zone
+3. The upload starts immediately while the app streams from MediaHub in the background
+4. Total time ≈ max(download time, upload time) instead of download + upload time
+5. No large files filling up your hard drive
 
----
+## Key Benefits
 
-## High-level flow
+- **Faster workflows**: Upload starts immediately, no waiting for downloads
+- **Save disk space**: No need to store multi-gigabyte video files locally
+- **Works with any website**: Standard drag-and-drop upload to any site that accepts file uploads
+- **Personalized copies**: Automatically embeds recipient information for tracking and security
+- **Native Mac experience**: Clean interface, no command-line required
 
-1) **Auth**: exchange `client_id`/`client_secret` (from a local config/env) for a **short‑lived OAuth token** (cached **in memory only**).
-2) **List titles**: `GET /v1/jobs?expand=file` returns the user’s video titles and embedded file objects (ids, sizes, content types).
-3) **User selection**: pick a job; if multiple outputs exist, let user pick the desired output (file id).
-4) **Recipient**: prompt for a **recipient identifier** (free text), which becomes `autograph_tag`.
-5) **Temp URL**: call `GET /v1/files/downloads` with `file_id`, `autograph_tag`, `redirect=true`. Follow the 30x redirect to the final URL.
-6) **Mount**: expose a read-only FUSE filesystem with a `Staged/` directory. Each staged selection appears as a single fixed-size file under a temp subfolder (e.g. file_id+recipient_id).
-7) **Drag**: the UI shows a big **draggable tile** that drags the **real file path** to the browser’s upload zone.
-8) **Overlap**: as the browser reads the path, the app streams from the temp URL using HTTP Range. Wall time ≈ `max(download, upload)`.
-9) **Evict**: after the upload (file handle closed), evict any local cache and remove the staged entry (configurable).
+## System Requirements
 
-> Important: do **not** use “promised files” for drag. The drag must provide a **real file path** on the mounted volume so browsers stream while reading.
+- **macOS 15.4 or later** (Sequoia)
+- **macFUSE 5.0+** with FSKit backend
+- **Xvid MediaHub account** with API credentials
 
 ---
 
-## External references
+## Getting Started
+
+Follow these step-by-step instructions to get FuseStream running on your Mac.
+
+### Step 1: Install macFUSE
+
+macFUSE is required for FuseStream to create the virtual filesystem on your Mac.
+
+1. **Download macFUSE:**
+   - Go to the [official macFUSE releases page](https://github.com/macfuse/macfuse/releases)
+   - Download the latest version (5.1.2 or newer):
+     ```
+     https://github.com/macfuse/macfuse/releases/download/macfuse-5.1.2/macfuse-5.1.2.dmg
+     ```
+
+2. **Install macFUSE:**
+   - Double-click the downloaded `.dmg` file
+   - Double-click "Install macFUSE" in the opened window
+   - Follow the installation wizard prompts
+   - Grant permissions when requested by macOS
+   - If you see a warning that System Extensions are blocked, click **"Ignore"** and continue
+
+3. **Enable the File System Extension:**
+   - Open **System Settings** (Apple menu → System Settings)
+   - Go to **Login Items & Extensions**
+   - Scroll down to the **Extensions** section at the bottom
+   - Click **File System Extensions**
+   - Toggle **ON** the switch for "macFUSE (local)"
+   - Click **Done**
+
+### Step 2: Download FuseStream
+
+1. **Download the latest release:**
+   - Visit the [FuseStream releases page](https://github.com/mmilitzer/fuse-stream-mvp/releases)
+   - Download `macos-build.zip` from the latest release (e.g., beta1):
+     ```
+     https://github.com/mmilitzer/fuse-stream-mvp/releases/download/beta1/macos-build.zip
+     ```
+
+2. **Install the application:**
+   - Unzip the downloaded file (double-click `macos-build.zip`)
+   - Move `fuse-stream-mvp.app` to your **Applications** folder (or any location you prefer)
+
+### Step 3: Configure FuseStream
+
+FuseStream needs your Xvid MediaHub API credentials to access your videos.
+
+#### 3.1: Get Your API Credentials
+
+If you don't have API credentials yet:
+1. Log in to your [Xvid MediaHub account](https://mediahub.xvid.com)
+2. Follow the [MediaHub API tutorial](https://mediahub.xvid.com/docs/Easy+step-by-step+Walkthrough) (Step 2) to create a new application
+3. Copy your `client_id` and `client_secret`
+
+#### 3.2: Create Configuration File
+
+1. **Copy this template** to your clipboard:
+
+```toml
+api_base   = "https://api.xvid.com/v1"
+client_id  = "YOUR_CLIENT_ID"
+client_secret = "YOUR_CLIENT_SECRET"
+
+# Mount location (adjust to your username)
+mountpoint = "/Users/YourUsername/FuseStream"
+
+# Required for beta1 - single-threaded mode for stability
+debug_fskit_single_thread = true
+
+# Optional settings
+fetch_mode = "temp-file"
+temp_dir = "/tmp"
+```
+
+2. **Find your home directory:**
+   - Open **Terminal** (Launchpad → Other → Terminal)
+   - Type `pwd` and press Enter
+   - You'll see something like `/Users/YourUsername` - copy this path
+
+3. **Edit the template:**
+   - Replace `YOUR_CLIENT_ID` with your actual client ID from step 3.1
+   - Replace `YOUR_CLIENT_SECRET` with your actual client secret
+   - Replace `/Users/YourUsername` in the mountpoint line with the path from step 2
+
+4. **Save the configuration file:**
+   - In Terminal, create the config directory:
+     ```bash
+     mkdir -p ~/.fuse-stream-mvp
+     ```
+   - Open a text editor to create the config file. You can use `nano`:
+     ```bash
+     nano ~/.fuse-stream-mvp/config.toml
+     ```
+   - Paste your edited configuration
+   - Save and exit:
+     - Press `Control + O` (to save)
+     - Press `Enter` (to confirm)
+     - Press `Control + X` (to exit)
+
+Alternatively, if you saved the template to a file called `config.toml` on your Desktop:
+```bash
+mkdir -p ~/.fuse-stream-mvp
+cp ~/Desktop/config.toml ~/.fuse-stream-mvp/
+```
+
+### Step 4: Run FuseStream
+
+1. **Launch the application:**
+   - Open **Finder** and navigate to where you installed the app
+   - Double-click **fuse-stream-mvp.app**
+   - If macOS shows a security warning about an unidentified developer:
+     - Open **System Settings** → **Privacy & Security**
+     - Scroll down and click **Open Anyway** next to the FuseStream message
+     - Click **Open** in the confirmation dialog
+
+2. **Using FuseStream:**
+   - The app will start and show your Xvid MediaHub videos
+   - **Select a video** from the list
+   - If the video has multiple outputs/formats, **choose the one you want**
+   - **Enter recipient information**: Type a unique identifier for the recipient (e.g., username, email, or ID)
+     - This creates a personalized copy with embedded tracking information
+   - Click **"Stage for Upload"**
+   - A draggable tile will appear showing the recipient ID
+   - **Drag the tile** into any website's upload zone (drag-and-drop area)
+   - The upload will start immediately while the app streams from MediaHub in the background
+   - You can monitor progress in the app window
+
+3. **Tips:**
+   - Keep the app running while uploads are in progress
+   - The app prevents your Mac from sleeping during active transfers
+   - Check logs if you encounter issues: `~/Library/Logs/FuseStream/fusestream.log`
+
+---
+
+## Troubleshooting
+
+**Mount fails with "unknown option" or "backend not found":**
+- Verify macFUSE ≥5 is installed: `ls /Library/Filesystems/macfuse.fs`
+- Check macOS version: `sw_vers` (should show ≥15.4)
+- Reinstall macFUSE from [macfuse.io](https://macfuse.io/)
+
+**"Operation not permitted" or permission errors:**
+- Ensure System Settings → Privacy & Security allows macFUSE
+- Check that mountpoint directory is writable
+- Try using a different mountpoint location (edit config.toml)
+
+**App crashes during drag:**
+- Check Console.app for crash logs
+- Verify file is visible in Finder at the mountpoint location (e.g., `/Users/YourUsername/FuseStream/Staged/`)
+- Try restarting the app (mount recovery will handle stale mounts)
+
+**Uploads freeze or app becomes unresponsive:**
+- Check `~/Library/Logs/FuseStream/fusestream.log` for diagnostic information
+- Ensure App Nap prevention is enabled (logged as `[appnap] App Nap prevention enabled`)
+- Keep the app window visible or check logs for `[lifecycle]` warnings
+
+**Cannot find config file:**
+- Verify the file exists: `ls -la ~/.fuse-stream-mvp/config.toml`
+- Check file permissions: `chmod 600 ~/.fuse-stream-mvp/config.toml`
+- Verify the file format is valid TOML
+
+---
+
+# Developer Documentation
+
+The following sections contain technical information for developers who want to build, modify, or contribute to FuseStream.
+
+---
+
+## Technical Overview
+
+FuseStream is built with Go, using Wails for the native macOS UI and cgofuse for FUSE filesystem support. The application creates a read-only virtual filesystem that streams content from Xvid MediaHub over HTTP Range requests while browsers perform uploads.
+
+### Data Flow
+
+1. **Auth**: Exchange `client_id`/`client_secret` (from config) for a short-lived OAuth token (cached in memory only)
+2. **List titles**: `GET /v1/jobs?expand=file` returns video titles and embedded file objects (IDs, sizes, content types)
+3. **User selection**: Pick a job; if multiple outputs exist, user selects the desired output (file ID)
+4. **Recipient**: Prompt for a recipient identifier (free text), which becomes `autograph_tag`
+5. **Temp URL**: Call `GET /v1/files/downloads` with `file_id`, `autograph_tag`, `redirect=true`. Follow the 30x redirect to the final URL
+6. **Mount**: Expose a read-only FUSE filesystem with a `Staged/` directory. Each staged selection appears as a single fixed-size file
+7. **Drag**: The UI shows a draggable tile that provides the real file path to the browser's upload zone
+8. **Overlap**: As the browser reads the path, the app streams from the temp URL using HTTP Range. Wall time ≈ max(download, upload)
+9. **Evict**: After upload completes (file handle closed), evict any local cache and remove the staged entry
+
+> **Technical Note:** The drag operation provides a real file path on the mounted volume (not "promised files"), allowing browsers to stream while reading.
+
+
+## API & External References
 
 - macFUSE FSKit (macOS 15.4+):  
   https://github.com/macfuse/macfuse/wiki/Getting-Started
@@ -55,7 +240,7 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 
 ---
 
-## Tech choices (MVP)
+## Technology Stack
 
 - **Language:** Go 1.22+
 - **Filesystem:** `cgofuse` (libfuse-compatible; should work with macFUSE FSKit & FUSE3 on Linux)
@@ -65,7 +250,7 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 
 ---
 
-## Repo layout (target)
+## Repository Structure
 
 ```
 /main.go                   # entrypoint: starts mount + launches UI
@@ -80,54 +265,38 @@ The files/downloads/ endpoint (after following redirect) supports **HTTP Range**
 
 ---
 
-## Config
+## Configuration Reference
 
-Create **`~/.fuse-stream-mvp/config.toml`**:
+For basic configuration, see the [Getting Started](#step-3-configure-fusestream) section above.
 
-```toml
-api_base   = "https://api.xvid.com/v1"
-client_id  = "YOUR_CLIENT_ID"
-client_secret = "YOUR_CLIENT_SECRET"
+### Advanced Configuration Options
 
-# Optional runtime overrides:
-mountpoint = "/Volumes/FuseStream"   # macOS default; e.g. "/mnt/fusestream" on Linux
-
-# Fetch mode (optional):
-fetch_mode = "temp-file"   # default: downloads entire file to temp dir (reliable, recommended)
-                           # experimental: "range-lru" (streams chunks on-demand, memory-based cache)
-temp_dir = "/tmp"          # temp file directory (only used in temp-file mode)
-
-# macOS system integration (optional):
-enable_app_nap = false     # Prevent App Nap when filesystem is mounted (default: false)
-                           # Enable if you experience performance issues when app loses focus
-```
-
-Environment variable overrides (take precedence):
-- `FSMVP_API_BASE`
-- `FSMVP_CLIENT_ID`
-- `FSMVP_CLIENT_SECRET`
-- `FSMVP_MOUNTPOINT`
-- `FSMVP_FETCH_MODE` (`temp-file` or `range-lru`)
-- `FSMVP_TEMP_DIR`
-- `FSMVP_ENABLE_APP_NAP` (`true`, `1`, or `yes` to enable)
-
-> The short‑lived **OAuth token is cached in memory only**.
+**Environment variable overrides** (take precedence over config.toml):
+- `FSMVP_API_BASE` - API base URL
+- `FSMVP_CLIENT_ID` - OAuth client ID
+- `FSMVP_CLIENT_SECRET` - OAuth client secret
+- `FSMVP_MOUNTPOINT` - Filesystem mount location
+- `FSMVP_FETCH_MODE` - `temp-file` (default) or `range-lru` (experimental)
+- `FSMVP_TEMP_DIR` - Temporary file directory
+- `FSMVP_ENABLE_APP_NAP` - Set to `true`, `1`, or `yes` to allow App Nap (not recommended)
+- `FSMVP_DEBUG_FSKIT_SINGLE_THREAD` - Set to `true` for single-threaded FSKit mode (debugging only)
 
 ### Fetch Modes
 
 **`temp-file` (default, recommended)**:
-- Downloads the entire file to a temporary file on first open
-- Subsequent reads are served from disk (fast, reliable)
-- Temp file persists until both UI staging and FUSE handles are closed (see BackingStore Lifecycle)
-- Best for: MVP use case, repeated uploads, stable performance
+- Downloads entire file to temporary storage on first open
+- Fast, reliable performance for repeated access
+- Temp file persists until both UI staging and FUSE handles close
+- Best for normal usage
 
 **`range-lru` (experimental)**:
 - Streams 4MB chunks on-demand via HTTP Range requests
-- LRU cache keeps 8 chunks (~32MB) in memory
-- No disk usage, but may be slower for non-sequential access
-- Best for: memory-constrained environments, testing
+- LRU cache with 8 chunks (~32MB) in memory
+- No disk usage, but slower for non-sequential access
+- Best for testing or memory-constrained environments
 
-For most users, the default `temp-file` mode is recommended.
+> **Security Note:** OAuth tokens are cached **in memory only** and never written to disk.
+
 
 ---
 
@@ -292,33 +461,6 @@ The GUI app mounts at `/Volumes/FuseStream` and opens a window:
 - List jobs → pick output (if multiple) → enter recipient id → **Stage for upload**
 - A file appears in `Staged/` and a big draggable tile is shown.
 - Drag the tile into the target site's upload zone; upload continues in background.
-
-### Troubleshooting
-
-**Mount fails with "unknown option" or "backend not found":**
-- Verify macFUSE ≥5 is installed: `ls /Library/Filesystems/macfuse.fs`
-- Check macOS version: `sw_vers` (should show ≥15.4)
-- Reinstall macFUSE from [macfuse.io](https://macfuse.io/)
-
-**"Operation not permitted" or permission errors:**
-- Ensure System Settings → Privacy & Security allows macFUSE
-- Check that mountpoint directory is writable
-
-**App crashes during drag:**
-- Check Console.app for crash logs
-- Verify file is visible in Finder at `/Volumes/FuseStream/Staged/`
-- Try restarting the app (mount recovery will handle stale mounts)
-
-**Sleep prevention not working:**
-- Check logs for `[sleep] Sleep prevention enabled` and `[appnap] App Nap prevention enabled`
-- Verify IOKit and Foundation frameworks are available
-- macOS may override sleep prevention for low battery or scheduled sleep
-
-**App becomes unresponsive when launched from Finder:**
-- Check `~/Library/Logs/FuseStream/fusestream.log` for diagnostic logs
-- Look for `[lifecycle]` entries showing foreground/background transitions
-- Verify App Nap prevention is enabled: `[appnap] App Nap prevention enabled`
-- If filesystem becomes unresponsive after losing focus, check logs for `[lifecycle] WARNING: FS unresponsive`
 
 ### Testing
 
